@@ -21,3 +21,6 @@ venv.bak/
 
 # Environment variables
 .env
+
+# Documents
+*.pdf
