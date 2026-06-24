@@ -127,6 +127,44 @@ CURVE_REQUIRED_COLUMNS = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Canonical FlowsFrame — the SINGLE energy-flows table every dispatch path emits
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Both Model O (LP read-back) and Model R (causal rule) must produce a DataFrame
+# with exactly these columns. All KPIs (SSR/SCR/GCmin/OSR) are computed from this
+# table and nowhere else — see optimizer/rule_dispatch.compute_flow_kpis().
+# Every column is power in MW at each timestep, except SOC which is energy in MWh.
+
+class FlowCols:
+    TIMESTAMP   = "timestamp"
+    LOAD_MW     = "load_mw"          # consumer demand
+    PV_AVAIL_MW = "pv_avail_mw"      # generation available (nameplate × p.u.)
+    PV_USED_MW  = "pv_used_mw"       # generation used on-site (to load or BESS)
+    GRID_IMP_MW = "grid_import_mw"   # import from grid
+    CHARGE_MW   = "bess_charge_mw"   # power into the BESS
+    DISCHARGE_MW= "bess_discharge_mw"# power out of the BESS
+    SOC_MWH     = "bess_soc_mwh"     # state of charge (energy)
+    CURTAIL_MW  = "curtailed_mw"     # generation spilled
+    UNMET_MW    = "unmet_mw"         # load shed (not served)
+    EXPORT_MW   = "export_mw"        # export to grid (0 for BTM import-only)
+
+
+FLOW_REQUIRED_COLUMNS = (
+    FlowCols.TIMESTAMP,
+    FlowCols.LOAD_MW,
+    FlowCols.PV_AVAIL_MW,
+    FlowCols.PV_USED_MW,
+    FlowCols.GRID_IMP_MW,
+    FlowCols.CHARGE_MW,
+    FlowCols.DISCHARGE_MW,
+    FlowCols.SOC_MWH,
+    FlowCols.CURTAIL_MW,
+    FlowCols.UNMET_MW,
+    FlowCols.EXPORT_MW,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Validation helper
 # ──────────────────────────────────────────────────────────────────────────────
 
