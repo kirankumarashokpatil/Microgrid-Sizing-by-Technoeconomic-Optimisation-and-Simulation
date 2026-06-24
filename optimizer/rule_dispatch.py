@@ -31,6 +31,7 @@ import pandas as pd
 from optimizer.params import PhysicalParams
 from optimizer.schema import (
     FLOW_REQUIRED_COLUMNS,
+    CurveCols,
     FlowCols,
     KpiKeys,
     require_columns,
@@ -341,3 +342,102 @@ def size_by_bisection(
             lo = mid
 
     return RuleSizingResult(pv_mw, hi, hi * duration_h, ceiling, k_best, feasible=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Verification — run a FIXED design under the rule (Model R) and report KPIs
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _mode_for(target_type: str) -> str:
+    return "peak_shaving" if target_type == "peak_shaving" else "self_sufficiency"
+
+
+def verify_sizing_with_rule(
+    profiles_df: pd.DataFrame,
+    params: PhysicalParams,
+    *,
+    pv_mw: float,
+    bess_mw: float,
+    bess_mwh: float,
+    target_type: str,
+    grid_ceiling_mw: float,
+) -> tuple[dict, pd.DataFrame]:
+    """
+    Operate a fixed (already-sized) design under the causal rule and return
+    (kpis, flows). The flows are validated against the physics invariants.
+
+    Mode/grid-charge follow the same policy as size_by_bisection: SSR designs
+    run self-sufficiency; peak-shaving designs reserve charge for peaks; the
+    no-PV sub-scenario is allowed to grid-charge (and nothing else is).
+    """
+    mode = _mode_for(target_type)
+    grid_charge = (mode == "peak_shaving") and (pv_mw <= 1e-9)
+    flows = run_rule_dispatch(
+        profiles_df, params,
+        pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
+        grid_ceiling_mw=grid_ceiling_mw, mode=mode, allow_grid_charge=grid_charge,
+    )
+    validate_flows(flows, params, bess_mwh=bess_mwh, export_limit_mw=params.export_limit_mw)
+    return compute_flow_kpis(flows, params.dt_hours), flows
+
+
+def attach_operational_kpis(
+    curve_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+    params: PhysicalParams,
+) -> pd.DataFrame:
+    """
+    For every feasible row of a Phase-1 sizing curve (Model O / LP), re-run the
+    design under the causal rule (Model R) and attach the operational KPIs plus
+    the SSR gap. Cheap (~5 ms/row), so it runs on the whole curve.
+
+    Adds columns: Operational SSR/SCR/Peak Grid/Unmet, and SSR Gap O−R (pp).
+
+    The causal rule models grid-connected BTM. Off-grid (F) and standalone-export
+    (G) topologies have different grid semantics, so they are left unverified
+    (LP columns only) rather than given misleading operational numbers.
+    """
+    if curve_df is None or curve_df.empty:
+        return curve_df
+    if getattr(params, "site_topology", "grid_connected_btm") != "grid_connected_btm":
+        return curve_df
+
+    op_ssr, op_scr, op_peak, op_unmet, op_gap = [], [], [], [], []
+    for _, row in curve_df.iterrows():
+        feasible = bool(row.get(CurveCols.FEASIBLE, False))
+        bess_mwh = row.get(CurveCols.BESS_MWH, None)
+        if not feasible or bess_mwh is None or pd.isna(bess_mwh):
+            op_ssr.append(None); op_scr.append(None); op_peak.append(None)
+            op_unmet.append(None); op_gap.append(None)
+            continue
+
+        target_type = row.get(CurveCols.TARGET_TYPE, "ssr")
+        pv_mw   = float(row.get(CurveCols.PV_MW, 0) or 0)
+        bess_mw = float(row.get(CurveCols.BESS_MW, 0) or 0)
+        # Grid ceiling: peak-shaving designs operate against their GC target;
+        # SSR designs run open (site grid limit) so we measure SSR, not shed.
+        if _mode_for(target_type) == "peak_shaving":
+            ceiling = float(row.get(CurveCols.TARGET_GC_MW, None)
+                            or row.get(CurveCols.PEAK_GC_MW, params.site_max_grid_mw))
+        else:
+            ceiling = params.site_max_grid_mw
+
+        kpis, _ = verify_sizing_with_rule(
+            profiles_df, params,
+            pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=float(bess_mwh),
+            target_type=target_type, grid_ceiling_mw=ceiling,
+        )
+        lp_ssr = float(row.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0)
+        op_ssr.append(kpis[KpiKeys.SSR])
+        op_scr.append(kpis[KpiKeys.SCR])
+        op_peak.append(kpis[KpiKeys.GCMIN_PEAK])
+        op_unmet.append(kpis[KpiKeys.TOTAL_UNMET_LOAD])
+        op_gap.append(round(lp_ssr - kpis[KpiKeys.SSR], 2))
+
+    out = curve_df.copy()
+    out[CurveCols.OP_SSR_PCT]    = op_ssr
+    out[CurveCols.OP_SCR_PCT]    = op_scr
+    out[CurveCols.OP_PEAK_GC_MW] = op_peak
+    out[CurveCols.OP_UNMET_MWH]  = op_unmet
+    out[CurveCols.OP_SSR_GAP_PP] = op_gap
+    return out

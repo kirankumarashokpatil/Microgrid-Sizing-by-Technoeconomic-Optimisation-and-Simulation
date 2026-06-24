@@ -215,6 +215,19 @@ def run_phase1(args):
                                               scenario_label="Standalone Gen · Curtailment",
                                               solver_time_limit=timeout)
 
+    # ── Operational verification (Model R) on every curve point ───────────────
+    # Attach the causal-rule SSR/SCR/peak/unmet next to the LP lower bound, plus
+    # the O−R gap, so each curve carries both numbers (DESIGN_REVIEW.md §1).
+    from optimizer.rule_dispatch import attach_operational_kpis
+    print("\n  [Model R] Verifying every curve point under the causal rule …")
+    # Grid-connected BTM scenarios only. F (off-grid) and G (standalone export)
+    # have different grid semantics and keep LP columns only.
+    curve_a = attach_operational_kpis(curve_a, df, params)
+    curve_b = attach_operational_kpis(curve_b, df, params)
+    curve_c = attach_operational_kpis(curve_c, df, params)
+    curve_d = attach_operational_kpis(curve_d, df, params)
+    curve_e = attach_operational_kpis(curve_e, df, params)
+
     save_phase1_report(
         output_path=args.output,
         profiles_df=df,
@@ -381,15 +394,15 @@ def run_phase2(args):
     from optimizer.plotter import plot_sizing_curves
     plot_sizing_curves(Path(args.p2_output).parent, curve_ssr=costed_ssr, curve_ps=costed_ps, surface=cooptimised_surface)
 
-    # ── Dispatch Verification ─────────────────────────────────────────────
+    # ── Dispatch Verification (Model R — causal rule, the contract truth) ──
     if args.verify_dispatch and ref_optimal is not None and not ref_optimal.empty:
         print(f"\n" + "=" * 65)
-        print(f"  PHASE 2 — DISPATCH VERIFICATION (ROLLING HORIZON)")
+        print(f"  PHASE 2 — DISPATCH VERIFICATION (CAUSAL RULE, Model R)")
         print("=" * 65)
-        from optimizer.dispatch_engine import run_dispatch_simulation
-        from optimizer.params import SizingResult, PhysicalParams
+        from optimizer.params import PhysicalParams
+        from optimizer.rule_dispatch import verify_sizing_with_rule
+        from optimizer.schema import KpiKeys
 
-        # Re-build physical params for dispatch
         phys_params = PhysicalParams(
             dt_hours=dt_hours, eff_charge=0.95, eff_discharge=0.95,
             min_soc_pct=10.0, max_soc_pct=90.0, initial_soc_pct=50.0,
@@ -397,24 +410,39 @@ def run_phase2(args):
             site_max_bess_mw=500.0, site_max_bess_mwh=4000.0, site_max_grid_mw=200.0,
         )
 
-        sz_res = SizingResult(
-            scenario_name="Phase 2 Optimum",
-            target_type=ref_optimal.get(CurveCols.TARGET_TYPE, "ssr"),
-            target_value=ref_optimal.get(CurveCols.TARGET_SSR_PCT, ref_optimal.get(CurveCols.TARGET_GC_MW, 0)),
-            pv_mw=float(ref_optimal.get(CurveCols.PV_MW, 0) or 0),
-            bess_mw=float(ref_optimal.get(CurveCols.BESS_MW, 0) or 0),
-            bess_mwh=float(ref_optimal.get(CurveCols.BESS_MWH, 0) or 0),
-            bess_duration_h=float(ref_optimal.get(CurveCols.BESS_DURATION_H, 0) or 0),
-            peak_grid_mw=float(ref_optimal.get(CurveCols.PEAK_GC_MW, 0) or 0),
-            achieved_ssr_pct=float(ref_optimal.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0),
+        target_type = ref_optimal.get(CurveCols.TARGET_TYPE, "ssr")
+        pv_mw   = float(ref_optimal.get(CurveCols.PV_MW, 0) or 0)
+        bess_mw = float(ref_optimal.get(CurveCols.BESS_MW, 0) or 0)
+        bess_mwh= float(ref_optimal.get(CurveCols.BESS_MWH, 0) or 0)
+        lp_ssr  = float(ref_optimal.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0)
+        # Peak-shaving designs verify against their GC target; SSR designs run open.
+        if target_type == "peak_shaving":
+            ceiling = float(ref_optimal.get(CurveCols.TARGET_GC_MW, None)
+                            or ref_optimal.get(CurveCols.PEAK_GC_MW, phys_params.site_max_grid_mw))
+        else:
+            ceiling = phys_params.site_max_grid_mw
+
+        print(f"\n  Operating: PV {pv_mw:.0f} MW | BESS {bess_mw:.1f} MW / {bess_mwh:.1f} MWh "
+              f"| grid ceiling {ceiling:.1f} MW | target={target_type}")
+        kpis, flows = verify_sizing_with_rule(
+            profiles_df, phys_params,
+            pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
+            target_type=target_type, grid_ceiling_mw=ceiling,
         )
 
-        print(f"\n  Running dispatch for: BESS {sz_res.bess_mw:.1f} MW / {sz_res.bess_mwh:.1f} MWh | Grid Limit {sz_res.peak_grid_mw:.1f} MW")
-        dispatch_df = run_dispatch_simulation(profiles_df, sz_res, phys_params, horizon_hours=48, overlap_hours=24)
-        
+        print(f"  [Model R] SSR={kpis[KpiKeys.SSR]:.1f}% (LP bound {lp_ssr:.1f}%, "
+              f"gap {lp_ssr - kpis[KpiKeys.SSR]:+.1f}pp)  |  SCR={kpis[KpiKeys.SCR]:.1f}%  "
+              f"|  peak grid={kpis[KpiKeys.GCMIN_PEAK]:.1f} MW  |  unmet={kpis[KpiKeys.TOTAL_UNMET_LOAD]:.1f} MWh")
+        if target_type == "peak_shaving":
+            verdict = "✓ holds" if kpis[KpiKeys.TOTAL_UNMET_LOAD] <= 1e-6 else "✗ sheds load"
+            print(f"  Peak-shaving check: peak {kpis[KpiKeys.GCMIN_PEAK]:.1f} MW vs ceiling {ceiling:.1f} MW → {verdict}")
+        else:
+            verdict = "✓ meets" if kpis[KpiKeys.SSR] >= lp_ssr - 1.0 else "✗ below LP bound"
+            print(f"  SSR check: operational {kpis[KpiKeys.SSR]:.1f}% vs LP bound {lp_ssr:.1f}% → {verdict}")
+
         d_out = Path(args.p2_output).parent / "Phase2_Dispatch_Verification.xlsx"
-        dispatch_df.to_excel(d_out, index=False)
-        print(f"  ✓ Dispatch verification saved to: {d_out.name}")
+        flows.to_excel(d_out, index=False)
+        print(f"  ✓ Dispatch verification (Model R flows) saved to: {d_out.name}")
 
 
 def _print_optimum(label, opt):

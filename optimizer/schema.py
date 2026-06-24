@@ -80,6 +80,15 @@ class CurveCols:
     EXPORTED_MWH     = "Total Exported (MWh)"
     FEASIBLE         = "Feasible"
 
+    # Operational verification under the causal rule (Model R). The columns above
+    # are the perfect-foresight LP (Model O, lower bound); these are what the
+    # auditable controller actually achieves, plus the gap between them.
+    OP_SSR_PCT       = "Operational SSR (%)"
+    OP_SCR_PCT       = "Operational SCR (%)"
+    OP_PEAK_GC_MW    = "Operational Peak Grid (MW)"
+    OP_UNMET_MWH     = "Operational Unmet (MWh)"
+    OP_SSR_GAP_PP    = "SSR Gap O−R (pp)"
+
     # Phase 2 overlay (added later — not populated by Phase 1)
     CAPEX_M          = "CAPEX (€M)"
     OPEX_M_YR        = "Annual OPEX (€M/yr)"
