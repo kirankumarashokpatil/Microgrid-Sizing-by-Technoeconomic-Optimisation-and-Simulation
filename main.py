@@ -454,11 +454,15 @@ def _print_optimum(label, opt):
     bh   = opt.get(CurveCols.BESS_DURATION_H, 0) or 0
     gc   = opt.get(CurveCols.PEAK_GC_MW, 0) or 0
     ssr  = opt.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0
-    scr  = opt.get(CurveCols.ACHIEVED_SCR_PCT, 0) or 0
+    op_ssr = opt.get(CurveCols.OP_SSR_PCT, None)
+    op_scr = opt.get(CurveCols.OP_SCR_PCT, None)
+    scr  = op_scr if (op_scr is not None and not pd.isna(op_scr)) else (opt.get(CurveCols.ACHIEVED_SCR_PCT, 0) or 0)
     cap  = opt.get("Total CAPEX (€M)", "?")
     lcoe = opt.get("LCOE (€/MWh)", "?")
+    # Operational (Model R) SSR is the honest number; LP value shown in parens.
+    ssr_txt = f"SSR(R) {op_ssr:.1f}% (LP {ssr:.1f}%)" if op_ssr is not None and not pd.isna(op_ssr) else f"SSR {ssr:.1f}%"
     print(f"   ✓ {label}: BESS {bmw:.1f} MW / {bmwh:.1f} MWh ({bh:.1f}h) | "
-          f"GC {gc:.1f} MW | SSR {ssr:.1f}% | SCR {scr:.1f}% | CAPEX €{cap:.1f}M | LCOE €{lcoe:.1f}/MWh")
+          f"GC {gc:.1f} MW | {ssr_txt} | SCR {scr:.1f}% | CAPEX €{cap:.1f}M | LCOE €{lcoe:.1f}/MWh")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

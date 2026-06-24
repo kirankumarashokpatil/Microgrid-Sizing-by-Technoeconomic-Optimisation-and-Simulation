@@ -34,6 +34,30 @@ from optimizer.schema import CurveCols
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 
+def _ssr_of(row) -> float:
+    """
+    The SSR to use for economics: the Model R operational value when present
+    (the honest, auditable number), falling back to the LP value for curves
+    generated before operational verification existed.
+    """
+    op = row.get(CurveCols.OP_SSR_PCT, None)
+    if op is not None and not pd.isna(op):
+        return float(op)
+    return float(row.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0)
+
+
+def _baseline_ssr(feasible_df: pd.DataFrame) -> float:
+    """
+    No-BESS self-consumption SSR — the PV-direct baseline used to estimate how
+    much SSR (and therefore BESS throughput) is attributable to the battery.
+    Derived from the least-storage feasible point instead of a hardcoded constant.
+    """
+    if feasible_df.empty:
+        return 0.0
+    idx = feasible_df[CurveCols.BESS_MWH].fillna(0).astype(float).idxmin()
+    return _ssr_of(feasible_df.loc[idx])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Load Phase 1 curves
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,6 +146,7 @@ def evaluate_costs(
         return curve_df
 
     total_demand_mwh = profiles_df["load_mw"].sum() * dt_hours
+    ssr_direct = _baseline_ssr(feasible)   # no-BESS PV-direct SSR (Model R), not hardcoded
 
     rows = []
     for _, row in feasible.iterrows():
@@ -129,7 +154,7 @@ def evaluate_costs(
         bess_mwh = float(row.get(CurveCols.BESS_MWH, 0) or 0)
         pv_mw    = float(row.get(CurveCols.PV_MW,    0) or 0)
         gc_mw    = float(row.get(CurveCols.PEAK_GC_MW, 0) or 0)
-        ssr      = float(row.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0)
+        ssr      = _ssr_of(row)   # operational (Model R) SSR when available
 
         # ── CAPEX ──────────────────────────────────────────────────────────
         capex_pv           = pv_mw    * eco.cost_pv_mw
@@ -139,13 +164,17 @@ def evaluate_costs(
         total_capex        = capex_pv + capex_bess_mw + capex_bess_mwh + capex_grid_conn
 
         # ── Annual OPEX ────────────────────────────────────────────────────
-        # Grid energy: SSR tells us what fraction comes from grid
-        annual_grid_mwh    = total_demand_mwh * (1.0 - ssr / 100.0)
+        # Grid energy: prefer the actual operational grid import (Model R) —
+        # exact, and correctly excludes shed load. Fall back to demand×(1−SSR).
+        op_grid = row.get(CurveCols.OP_GRID_MWH, None)
+        if op_grid is not None and not pd.isna(op_grid):
+            annual_grid_mwh = float(op_grid)
+        else:
+            annual_grid_mwh = total_demand_mwh * (1.0 - ssr / 100.0)
         annual_grid_cost   = annual_grid_mwh * eco.grid_cost_mwh
 
-        # BESS degradation: estimate equivalent full cycles from SSR improvement
-        # Approximate: BESS cycles ≈ (SSR_achieved - SSR_direct) * demand / bess_mwh
-        ssr_direct = 39.6  # typical direct SSR from 150 MW PV without BESS (data-specific)
+        # BESS degradation: equivalent throughput from SSR lifted above the
+        # no-BESS PV-direct baseline (derived from the curve, not hardcoded).
         ssr_from_bess = max(0.0, ssr - ssr_direct)
         annual_bess_throughput = (ssr_from_bess / 100.0) * total_demand_mwh
         annual_deg_cost = annual_bess_throughput * eco.real_deg_cost
@@ -215,9 +244,22 @@ def find_optimal_point(
     if feasible.empty:
         return pd.Series()
 
-    ssr_col = CurveCols.ACHIEVED_SSR_PCT
+    # Reliability gate: never recommend a design that sheds load under the causal
+    # rule (Model R). The CEO brief is explicit that unmet load is not a free
+    # variable to hide behind. Keep the optimum among operationally-compliant
+    # designs; only if none exist do we fall back (the verifier then flags it).
+    if CurveCols.OP_UNMET_MWH in feasible.columns:
+        compliant = feasible[feasible[CurveCols.OP_UNMET_MWH].fillna(0) <= 1.0]
+        if not compliant.empty:
+            feasible = compliant
+
+    # Rank on the operational (Model R) SSR when present — the LP value is a solver
+    # artifact for non-binding points. Mirrored into a working column.
+    ssr_col = "_ssr_for_ranking"
+    feasible[ssr_col] = feasible.apply(_ssr_of, axis=1)
     cap_col = "Total CAPEX (€M)"
 
+    result = None
     if objective == "knee":
         # Knee-of-curve: maximise incremental SSR per incremental € of CAPEX.
         # IMPORTANT: only consider points where the BESS is actually deployed.
@@ -228,11 +270,8 @@ def find_optimal_point(
         engaged = feasible[feasible.get(bess_col, 0).fillna(0) > 0.1].copy() if bess_col in feasible.columns else feasible
         if engaged.empty:
             # No design uses storage at all — fall back to the cheapest point.
-            if cap_col in feasible.columns:
-                return feasible.loc[feasible[cap_col].idxmin()]
-            return feasible.iloc[0]
-
-        if ssr_col in engaged.columns and cap_col in engaged.columns:
+            result = feasible.loc[feasible[cap_col].idxmin()] if cap_col in feasible.columns else feasible.iloc[0]
+        elif ssr_col in engaged.columns and cap_col in engaged.columns:
             ranked = engaged.sort_values(ssr_col).reset_index()
             ranked["delta_ssr"]   = ranked[ssr_col].diff().fillna(0)
             ranked["delta_capex"] = ranked[cap_col].diff().fillna(0)
@@ -240,37 +279,35 @@ def find_optimal_point(
             valid = ranked[(ranked["delta_ssr"] > 0) & (ranked["delta_capex"] >= 0)].copy()
             if valid.empty:
                 # Fall back: highest-SSR engaged point
-                return engaged.sort_values(ssr_col).iloc[-1]
-            valid["marginal_€M_per_pct_ssr"] = valid["delta_capex"] / valid["delta_ssr"]
-            # Knee = last point before marginal cost exceeds 2.5× the initial marginal
-            first_marginal = valid["marginal_€M_per_pct_ssr"].iloc[0]
-            threshold = first_marginal * 2.5
-            below = valid[valid["marginal_€M_per_pct_ssr"] <= threshold]
-            best_orig_idx = (below.iloc[-1]["index"] if not below.empty
-                             else valid.iloc[0]["index"])
-            return engaged.loc[best_orig_idx]
+                result = engaged.sort_values(ssr_col).iloc[-1]
+            else:
+                valid["marginal_€M_per_pct_ssr"] = valid["delta_capex"] / valid["delta_ssr"]
+                # Knee = last point before marginal cost exceeds 2.5× the initial marginal
+                first_marginal = valid["marginal_€M_per_pct_ssr"].iloc[0]
+                threshold = first_marginal * 2.5
+                below = valid[valid["marginal_€M_per_pct_ssr"] <= threshold]
+                best_orig_idx = (below.iloc[-1]["index"] if not below.empty
+                                 else valid.iloc[0]["index"])
+                result = engaged.loc[best_orig_idx]
         else:
-            return engaged.iloc[-1]
-
-    elif objective == "min_cost":
-        col = "NPV Costs (€M)"
-        idx = feasible[col].idxmin() if col in feasible.columns else feasible.index[0]
-
-    elif objective == "lcoe":
-        col = "LCOE (€/MWh)"
-        idx = feasible[col].idxmin() if col in feasible.columns else feasible.index[0]
-
-    elif objective == "capex":
-        col = cap_col
-        idx = feasible[col].idxmin() if col in feasible.columns else feasible.index[0]
-
-    elif objective == "ssr":
-        idx = feasible[ssr_col].idxmax() if ssr_col in feasible.columns else feasible.index[-1]
-
+            result = engaged.iloc[-1]
     else:
-        idx = feasible.index[0]
+        if objective == "min_cost":
+            col = "NPV Costs (€M)"
+            idx = feasible[col].idxmin() if col in feasible.columns else feasible.index[0]
+        elif objective == "lcoe":
+            col = "LCOE (€/MWh)"
+            idx = feasible[col].idxmin() if col in feasible.columns else feasible.index[0]
+        elif objective == "capex":
+            idx = feasible[cap_col].idxmin() if cap_col in feasible.columns else feasible.index[0]
+        elif objective == "ssr":
+            idx = feasible[ssr_col].idxmax() if ssr_col in feasible.columns else feasible.index[-1]
+        else:
+            idx = feasible.index[0]
+        result = feasible.loc[idx]
 
-    return feasible.loc[idx]
+    # Strip the internal ranking column before handing the row back.
+    return result.drop(labels=[ssr_col], errors="ignore")
 
 
 

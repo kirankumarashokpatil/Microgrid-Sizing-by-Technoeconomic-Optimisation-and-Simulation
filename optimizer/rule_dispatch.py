@@ -402,13 +402,13 @@ def attach_operational_kpis(
     if getattr(params, "site_topology", "grid_connected_btm") != "grid_connected_btm":
         return curve_df
 
-    op_ssr, op_scr, op_peak, op_unmet, op_gap = [], [], [], [], []
+    op_ssr, op_scr, op_peak, op_grid, op_unmet, op_gap = [], [], [], [], [], []
     for _, row in curve_df.iterrows():
         feasible = bool(row.get(CurveCols.FEASIBLE, False))
         bess_mwh = row.get(CurveCols.BESS_MWH, None)
         if not feasible or bess_mwh is None or pd.isna(bess_mwh):
             op_ssr.append(None); op_scr.append(None); op_peak.append(None)
-            op_unmet.append(None); op_gap.append(None)
+            op_grid.append(None); op_unmet.append(None); op_gap.append(None)
             continue
 
         target_type = row.get(CurveCols.TARGET_TYPE, "ssr")
@@ -431,6 +431,7 @@ def attach_operational_kpis(
         op_ssr.append(kpis[KpiKeys.SSR])
         op_scr.append(kpis[KpiKeys.SCR])
         op_peak.append(kpis[KpiKeys.GCMIN_PEAK])
+        op_grid.append(kpis[KpiKeys.TOTAL_GRID_IMPORT])
         op_unmet.append(kpis[KpiKeys.TOTAL_UNMET_LOAD])
         op_gap.append(round(lp_ssr - kpis[KpiKeys.SSR], 2))
 
@@ -438,6 +439,7 @@ def attach_operational_kpis(
     out[CurveCols.OP_SSR_PCT]    = op_ssr
     out[CurveCols.OP_SCR_PCT]    = op_scr
     out[CurveCols.OP_PEAK_GC_MW] = op_peak
+    out[CurveCols.OP_GRID_MWH]   = op_grid
     out[CurveCols.OP_UNMET_MWH]  = op_unmet
     out[CurveCols.OP_SSR_GAP_PP] = op_gap
     return out

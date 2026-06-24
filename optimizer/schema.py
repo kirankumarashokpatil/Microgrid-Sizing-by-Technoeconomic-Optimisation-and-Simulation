@@ -86,6 +86,7 @@ class CurveCols:
     OP_SSR_PCT       = "Operational SSR (%)"
     OP_SCR_PCT       = "Operational SCR (%)"
     OP_PEAK_GC_MW    = "Operational Peak Grid (MW)"
+    OP_GRID_MWH      = "Operational Grid Import (MWh)"
     OP_UNMET_MWH     = "Operational Unmet (MWh)"
     OP_SSR_GAP_PP    = "SSR Gap O−R (pp)"
 
