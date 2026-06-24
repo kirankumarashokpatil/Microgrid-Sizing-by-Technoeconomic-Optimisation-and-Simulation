@@ -80,6 +80,7 @@ def solve_sizing_point(
 
     model = _build_lp(df, params, pv_mw_fixed, target_type, target_value, target_gc_mw)
     solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    results = None
     try:
         results = solver.solve(model, tee=False, load_solutions=False)
         ok = (
@@ -92,13 +93,8 @@ def solve_sizing_point(
         ok = False
         print(f"   ✗ Solver exception: {e}")
 
-    ok = (
-        results.solver.status == pyo.SolverStatus.ok
-        and results.solver.termination_condition == pyo.TerminationCondition.optimal
-    )
-
     if not ok:
-        cond = getattr(results.solver, "termination_condition", "unknown") if 'results' in locals() else "unknown"
+        cond = getattr(results.solver, "termination_condition", "unknown") if results is not None else "exception"
         label = scenario_label or f"{target_type}={target_value}"
         print(f"   ✗ [{label}] Infeasible / solver failed: {cond}")
         return SizingResult(
@@ -182,6 +178,7 @@ def find_ssr_max(
         target_value=0.0,       # no target — free to minimise grid
     )
     solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    results = None
     try:
         results = solver.solve(model, tee=False, load_solutions=False)
         ok = (
@@ -194,8 +191,11 @@ def find_ssr_max(
         ok = False
 
     if not ok:
-        print("   [find_ssr_max] Solver failed — defaulting to 80% SSR max.")
-        return 80.0
+        cond = getattr(results.solver, "termination_condition", "unknown") if results is not None else "exception"
+        # Fail loud: this value sets the SSR sweep ceiling. A silent default would
+        # corrupt the entire curve that flows into an IC pack (DESIGN_REVIEW.md §3).
+        raise RuntimeError(f"[find_ssr_max] solver failed ({cond}) — refusing to "
+                           f"guess SSR_max; fix the model/data and re-run.")
 
     dt = params.dt_hours
     total_demand = sum(df["load_mw"].iloc[t] for t in model.T) * dt
@@ -223,6 +223,7 @@ def find_gc_min(
         target_value=0.0,       # no target — free to minimise peak
     )
     solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    results = None
     try:
         results = solver.solve(model, tee=False, load_solutions=False)
         ok = (
@@ -235,8 +236,10 @@ def find_gc_min(
         ok = False
 
     if not ok:
-        print("   [find_gc_min] Solver failed — defaulting to 10 MW gc_min.")
-        return 10.0
+        cond = getattr(results.solver, "termination_condition", "unknown") if results is not None else "exception"
+        # Fail loud: this value sets the peak-shaving sweep floor (DESIGN_REVIEW.md §3).
+        raise RuntimeError(f"[find_gc_min] solver failed ({cond}) — refusing to "
+                           f"guess GC_min; fix the model/data and re-run.")
 
     # Read the peak_gc variable that was added by the find_min_gc objective builder
     if hasattr(model, "peak_gc"):

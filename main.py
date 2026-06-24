@@ -72,7 +72,8 @@ def parse_args():
     p.add_argument("--solver-timeout", type=int, default=120,
                    help="HiGHS solver time limit per LP solve (seconds). Default: 120")
     p.add_argument("--resample-15min", action="store_true",
-                   help="Resample hourly data to 15-minute resolution (Phase 1 & 2)")
+                   help="Run at 15-min resolution. Requires NATIVE 15-min profiles; "
+                        "errors on hourly data (peaks are not fabricated by interpolation).")
 
     # ── Phase 2 args ──────────────────────────────────────────────────────
     p.add_argument("--curves", default=str(_DEFAULT_CURVES),
