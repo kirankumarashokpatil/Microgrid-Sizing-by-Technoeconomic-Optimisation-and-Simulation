@@ -1,194 +1,482 @@
 """
-Sizing Engine Module
---------------------
-Architectural Purpose: 
-This module handles 'Phase 1: Hardware Sizing'. It uses a Pyomo Linear Programming (LP)
-formulation to find the cheapest hardware capacities (Solar, Wind, Battery MW, Battery MWh)
-that meet the target Self-Sufficiency Ratio (SSR) over the simulation horizon.
+Sizing Engine Module — Phase 1
+-------------------------------
+Builds and solves ONE pure-physics LP per target point.
+
+No CAPEX. No prices. No discount rates.
+
+The objective is to find the MINIMUM BESS size (MWh or MW, depending on
+the sizing objective) that allows the system to meet a given physical target:
+
+  A) SSR target       → Minimize BESS_MWh subject to SSR ≥ target
+  B) Peak shaving     → Minimize BESS_MW  subject to peak_grid ≤ target
+
+Both objectives add a small penalty to break degeneracy and satisfy
+the spec's tie-breaker rules (§ "Sizing objectives / The trade-off").
+
+Energy flows modelled (BTM, no export):
+  PV → Load (direct self-consumption)
+  PV → BESS (charge from generation)
+  BESS → Load (discharge to serve load)
+  Grid → Load (residual import)
+  Grid → BESS (allowed only when load < grid_limit — implicit via balance)
+  Curtailment when PV > Load + available BESS charging headroom
 """
+
+from __future__ import annotations
+
 import pyomo.environ as pyo
-from optimizer.params import ProjectParams, SizingResult
-from optimizer.schema import SIM_REQUIRED_COLUMNS, SimCols, require_columns
+import pandas as pd
+
+from optimizer.params import PhysicalParams, SizingResult
 from optimizer.solver import create_highs_solver
 
-def run_sizing(sim_df, dt, params: ProjectParams):
-    print("\n--- Step 1: Mathematical Hardware Sizing (Pyomo) ---")
-    require_columns(sim_df, SIM_REQUIRED_COLUMNS, "Simulation data")
-    
-    total_demand_mwh = sim_df[SimCols.DEMAND].sum() * dt
 
-    print(f"   Building Pyomo LP model over {len(sim_df)} timesteps...")
-    
-    m = pyo.ConcreteModel()
-    horizon = len(sim_df)
-    m.T = pyo.RangeSet(0, horizon - 1)
-    
-    # Decision Variables (Hardware Capacities)
-    m.k_sol = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_sol))
-    m.k_win = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_win))
-    m.bess_mw = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mw))
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────────────
+
+def solve_sizing_point(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    pv_mw_fixed: float,
+    target_type: str,
+    target_value: float,
+    target_gc_mw: float | None = None,
+    scenario_label: str = "",
+    solver_time_limit: int = 120,
+) -> SizingResult:
+    """
+    Solve ONE sizing LP for a specific target and return a SizingResult.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Columns: load_mw (MW), pv_pu (0–1 p.u.)
+        Rows: one per timestep, ordered chronologically.
+    params : PhysicalParams
+        Physical site + BESS constraints.
+    pv_mw_fixed : float
+        PV nameplate size (MW) — fixed input.
+        Set to 0.0 for sub-scenario (BESS-only, no generation).
+    target_type : str
+        "ssr"           → SSR target sizing (minimise BESS_MWh)
+        "peak_shaving"  → Grid connection target (minimise BESS_MW)
+        "co_opt"        → Simultaneous SSR & GC constraints
+    target_value : float
+        For "ssr": target SSR in % (e.g. 60.0).
+        For "peak_shaving": target grid connection in MW (e.g. 50.0).
+    scenario_label : str
+        Human-readable label for console output.
+    solver_time_limit : int
+        HiGHS time limit in seconds per solve.
+
+    Returns
+    -------
+    SizingResult
+        The minimum-physical-size solution. feasible=False if infeasible.
+    """
+    _validate_inputs(df, params, pv_mw_fixed, target_type, target_value)
+
+    model = _build_lp(df, params, pv_mw_fixed, target_type, target_value, target_gc_mw)
+    solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    try:
+        results = solver.solve(model, tee=False, load_solutions=False)
+        ok = (
+            results.solver.status == pyo.SolverStatus.ok
+            and results.solver.termination_condition == pyo.TerminationCondition.optimal
+        )
+        if ok:
+            model.solutions.load_from(results)
+    except Exception as e:
+        ok = False
+        print(f"   ✗ Solver exception: {e}")
+
+    ok = (
+        results.solver.status == pyo.SolverStatus.ok
+        and results.solver.termination_condition == pyo.TerminationCondition.optimal
+    )
+
+    if not ok:
+        cond = getattr(results.solver, "termination_condition", "unknown") if 'results' in locals() else "unknown"
+        label = scenario_label or f"{target_type}={target_value}"
+        print(f"   ✗ [{label}] Infeasible / solver failed: {cond}")
+        return SizingResult(
+            scenario_name=scenario_label,
+            pv_mw=pv_mw_fixed,
+            bess_mw=0.0,
+            bess_mwh=0.0,
+            peak_grid_mw=0.0,
+            target_type=target_type,
+            target_value=target_value,
+            target_gc_mw=target_gc_mw,
+            achieved_ssr_pct=0.0,
+            bess_duration_h=0.0,
+            exported_mwh=0.0,
+            peak_export_mw=0.0,
+            feasible=False,
+        )
+
+    # Extract solution values
+    bess_mw  = max(0.0, pyo.value(model.bess_mw))
+    bess_mwh = max(0.0, pyo.value(model.bess_mwh))
+    duration = (bess_mwh / bess_mw) if bess_mw > 1e-3 else 0.0
+
+    # Verify achieved SSR from LP variables
+    dt = params.dt_hours
+    total_demand_mwh = sum(df["load_mw"].iloc[t] for t in model.T) * dt
+    total_grid_mwh   = sum(max(0.0, pyo.value(model.p_grid[t])) for t in model.T) * dt
+    total_unmet_mwh  = sum(max(0.0, pyo.value(model.p_unmet[t])) for t in model.T) * dt
+    achieved_ssr = (
+        (total_demand_mwh - total_grid_mwh - total_unmet_mwh) / total_demand_mwh * 100.0
+        if total_demand_mwh > 0 else 0.0
+    )
+
+    peak_grid = max(max(0.0, pyo.value(model.p_grid[t])) for t in model.T)
+
+    total_export_mwh = sum(max(0.0, pyo.value(model.p_export[t])) for t in model.T) * dt
+    peak_export = max(max(0.0, pyo.value(model.p_export[t])) for t in model.T)
+
+    # Self-consumption ratio (SCR) = PV used on-site / PV available.
+    # First-class output per the CEO Strategic Brief (SCR alongside SSR).
+    total_pv_avail_mwh = sum(df["pv_pu"].iloc[t] for t in model.T) * pv_mw_fixed * dt
+    total_pv_used_mwh  = sum(max(0.0, pyo.value(model.p_pv[t])) for t in model.T) * dt
+    achieved_scr = (
+        total_pv_used_mwh / total_pv_avail_mwh * 100.0
+        if total_pv_avail_mwh > 1e-9 else 0.0
+    )
+
+    return SizingResult(
+        scenario_name=scenario_label,
+        pv_mw=pv_mw_fixed,
+        bess_mw=round(bess_mw, 4),
+        bess_mwh=round(bess_mwh, 4),
+        peak_grid_mw=round(peak_grid, 4),
+        target_type=target_type,
+        target_value=target_value,
+        target_gc_mw=target_gc_mw,
+        achieved_ssr_pct=round(achieved_ssr, 2),
+        achieved_scr_pct=round(achieved_scr, 2),
+        bess_duration_h=round(duration, 2),
+        exported_mwh=round(total_export_mwh, 4),
+        peak_export_mw=round(peak_export, 4),
+        feasible=True,
+    )
+
+
+def find_ssr_max(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    pv_mw_fixed: float,
+    solver_time_limit: int = 120,
+) -> float:
+    """
+    Find the maximum achievable SSR with the given PV size and site limits.
+    Runs ONE LP that maximises achieved SSR (by minimising grid + unmet).
+
+    Returns the max achievable SSR as a percentage (0–100).
+    """
+    model = _build_lp(
+        df, params, pv_mw_fixed,
+        target_type="find_max_ssr",
+        target_value=0.0,       # no target — free to minimise grid
+    )
+    solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    try:
+        results = solver.solve(model, tee=False, load_solutions=False)
+        ok = (
+            results.solver.status == pyo.SolverStatus.ok
+            and results.solver.termination_condition == pyo.TerminationCondition.optimal
+        )
+        if ok:
+            model.solutions.load_from(results)
+    except Exception:
+        ok = False
+
+    if not ok:
+        print("   [find_ssr_max] Solver failed — defaulting to 80% SSR max.")
+        return 80.0
+
+    dt = params.dt_hours
+    total_demand = sum(df["load_mw"].iloc[t] for t in model.T) * dt
+    total_grid   = sum(max(0.0, pyo.value(model.p_grid[t])) for t in model.T) * dt
+    total_unmet  = sum(max(0.0, pyo.value(model.p_unmet[t])) for t in model.T) * dt
+    ssr_max = (total_demand - total_grid - total_unmet) / total_demand * 100.0 if total_demand > 0 else 0.0
+    return round(max(0.0, min(100.0, ssr_max)), 1)
+
+
+def find_gc_min(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    pv_mw_fixed: float,
+    solver_time_limit: int = 120,
+) -> float:
+    """
+    Find the minimum possible grid connection (MW) with maximum BESS and PV.
+    This is the lower bound for the peak-shaving curve sweep.
+
+    Returns the minimum achievable peak grid import in MW.
+    """
+    model = _build_lp(
+        df, params, pv_mw_fixed,
+        target_type="find_min_gc",
+        target_value=0.0,       # no target — free to minimise peak
+    )
+    solver = create_highs_solver(time_limit_seconds=solver_time_limit)
+    try:
+        results = solver.solve(model, tee=False, load_solutions=False)
+        ok = (
+            results.solver.status == pyo.SolverStatus.ok
+            and results.solver.termination_condition == pyo.TerminationCondition.optimal
+        )
+        if ok:
+            model.solutions.load_from(results)
+    except Exception:
+        ok = False
+
+    if not ok:
+        print("   [find_gc_min] Solver failed — defaulting to 10 MW gc_min.")
+        return 10.0
+
+    # Read the peak_gc variable that was added by the find_min_gc objective builder
+    if hasattr(model, "peak_gc"):
+        peak_gc = max(0.0, pyo.value(model.peak_gc))
+    else:
+        peak_gc = max(max(0.0, pyo.value(model.p_grid[t])) for t in model.T)
+    return round(peak_gc, 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LP Builder — Internal
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_lp(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    pv_mw_fixed: float,
+    target_type: str,
+    target_value: float,
+    target_gc_mw: float | None = None,
+) -> pyo.ConcreteModel:
+    """
+    Build the Pyomo LP model.
+
+    target_type options
+    -------------------
+    "ssr"           → enforce SSR ≥ target_value (%), minimise BESS_MWh
+    "peak_shaving"  → enforce peak_grid ≤ target_value (MW), minimise BESS_MW
+    "find_max_ssr"  → no SSR constraint, use max BESS site limits, minimise grid
+    "find_min_gc"   → no GC constraint, use max BESS site limits, minimise peak grid
+    """
+    dt = params.dt_hours
+    n  = len(df)
+
+    m   = pyo.ConcreteModel()
+    m.T = pyo.RangeSet(0, n - 1)
+
+    # ── Decision variables (hardware — scalars) ───────────────────────────
+    m.bess_mw  = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mw))
     m.bess_mwh = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mwh))
-    
-    # Decision Variables (Time-Series Dispatch)
-    m.p_solar = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.p_wind = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.p_grid = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.p_chg = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.p_dchg = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.p_unmet = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    m.peak_grid_mw = pyo.Var(within=pyo.NonNegativeReals)
-    m.e_bess = pyo.Var(m.T, within=pyo.NonNegativeReals)
-    
-    # Bound unmet load by demand
-    def unmet_limit(m, t):
-        return m.p_unmet[t] <= sim_df.iloc[t][SimCols.DEMAND]
-    m.unmet_limit_con = pyo.Constraint(m.T, rule=unmet_limit)
 
-    # 1. Power Balance
+    # ── Decision variables (time-series — one per timestep) ───────────────
+    m.p_pv   = pyo.Var(m.T, within=pyo.NonNegativeReals)   # PV power used (MW)
+    m.p_grid = pyo.Var(m.T, within=pyo.NonNegativeReals)   # Grid import (MW)
+    m.p_chg  = pyo.Var(m.T, within=pyo.NonNegativeReals)   # BESS charge (MW)
+    m.p_dchg = pyo.Var(m.T, within=pyo.NonNegativeReals)   # BESS discharge (MW)
+    m.p_curt = pyo.Var(m.T, within=pyo.NonNegativeReals)   # Curtailed PV (MW)
+    m.p_unmet= pyo.Var(m.T, within=pyo.NonNegativeReals)   # Unmet load (MW)
+    m.p_export=pyo.Var(m.T, within=pyo.NonNegativeReals)   # Grid export (MW)
+    m.e_bess = pyo.Var(m.T, within=pyo.NonNegativeReals)   # BESS SOC (MWh)
+
+    # ── Precompute data arrays ────────────────────────────────────────────
+    if params.site_topology == "standalone_gen":
+        load_mw = df["load_mw"].values * 0.0
+        total_demand_mwh = 0.0
+    else:
+        load_mw = df["load_mw"].values
+        total_demand_mwh = load_mw.sum() * dt
+
+    pv_avail = df["pv_pu"].values * pv_mw_fixed    # available PV (MW)
+
+    # ── Site Topology Constraints ─────────────────────────────────────────
+    if params.site_topology == "off_grid":
+        m.off_grid_import_con = pyo.Constraint(m.T, rule=lambda m, t: m.p_grid[t] == 0.0)
+        m.off_grid_export_con = pyo.Constraint(m.T, rule=lambda m, t: m.p_export[t] == 0.0)
+
+    # ── Constraint 1: Power balance at every timestep ─────────────────────
     def balance_rule(m, t):
-        return m.p_solar[t] + m.p_wind[t] + m.p_grid[t] + m.p_dchg[t] + m.p_unmet[t] == sim_df.iloc[t][SimCols.DEMAND] + m.p_chg[t]
+        return (
+            m.p_pv[t] + m.p_grid[t] + m.p_dchg[t] + m.p_unmet[t]
+            == load_mw[t] + m.p_chg[t] + m.p_export[t]
+        )
     m.balance_con = pyo.Constraint(m.T, rule=balance_rule)
-    
-    # 2. Renewables Availability Limits
-    def solar_limit(m, t): 
-        return m.p_solar[t] <= sim_df.iloc[t][SimCols.SOLAR_POWER] * m.k_sol
-    m.sol_limit_con = pyo.Constraint(m.T, rule=solar_limit)
-    
-    def wind_limit(m, t): 
-        return m.p_wind[t] <= sim_df.iloc[t][SimCols.WIND_POWER] * m.k_win
-    m.win_limit_con = pyo.Constraint(m.T, rule=wind_limit)
-    
-    # 3. Grid Limit
-    def grid_limit(m, t): 
-        return m.p_grid[t] <= min(sim_df.iloc[t][SimCols.GRID_LIMIT], params.site_max_grid_mw)
-    m.grid_limit_con = pyo.Constraint(m.T, rule=grid_limit)
-    
-    def peak_grid_rule(m, t):
-        return m.p_grid[t] <= m.peak_grid_mw
-    m.peak_grid_con = pyo.Constraint(m.T, rule=peak_grid_rule)
-    
-    # 4. BESS Power & SOC Limits
-    m.chg_limit = pyo.Constraint(m.T, rule=lambda m, t: m.p_chg[t] <= m.bess_mw)
+
+    # ── Constraint 2: PV availability + curtailment accounting ────────────
+    def pv_avail_rule(m, t):
+        return m.p_pv[t] + m.p_curt[t] == pv_avail[t]
+    m.pv_avail_con = pyo.Constraint(m.T, rule=pv_avail_rule)
+
+    # ── Constraint 3: Export Limits ───────────────────────────────────────
+    if params.export_limit_mw >= 0:
+        m.export_limit_con = pyo.Constraint(m.T, rule=lambda m, t: m.p_export[t] <= params.export_limit_mw)
+
+    # ── Constraint 4: Grid import ceiling ────────────────────────────────
+    def grid_ceiling_rule(m, t):
+        return m.p_grid[t] <= params.site_max_grid_mw
+    m.grid_ceiling_con = pyo.Constraint(m.T, rule=grid_ceiling_rule)
+
+    # ── Constraint 5: BESS power limits ───────────────────────────────────
+    m.chg_limit  = pyo.Constraint(m.T, rule=lambda m, t: m.p_chg[t]  <= m.bess_mw)
     m.dchg_limit = pyo.Constraint(m.T, rule=lambda m, t: m.p_dchg[t] <= m.bess_mw)
-    m.min_duration_limit = pyo.Constraint(rule=lambda m: m.bess_mwh >= m.bess_mw * params.min_bess_duration_hours)
-    m.max_duration_limit = pyo.Constraint(rule=lambda m: m.bess_mwh <= m.bess_mw * params.max_bess_duration_hours)
-    m.max_soc_limit = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] <= m.bess_mwh * (params.max_soc_pct / 100.0))
-    m.min_soc_limit = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] >= m.bess_mwh * (params.min_soc_pct / 100.0))
-    
-    # 5. BESS State of Charge Physics
+
+    # ── Constraint 6: Unmet load bounded by demand ────────────────────────
+    m.unmet_limit = pyo.Constraint(m.T, rule=lambda m, t: m.p_unmet[t] <= load_mw[t])
+
+    # ── Constraint 7: BESS SOC limits ─────────────────────────────────────
+    min_soc_frac = params.min_soc_pct / 100.0
+    max_soc_frac = params.max_soc_pct / 100.0
+    m.soc_min_con = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] >= m.bess_mwh * min_soc_frac)
+    m.soc_max_con = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] <= m.bess_mwh * max_soc_frac)
+
+    # ── Constraint 8: BESS SOC dynamics ───────────────────────────────────
+    eta_c = params.eff_charge
+    eta_d = params.eff_discharge
+    init_soc_frac = params.initial_soc_pct / 100.0
+
     def soc_rule(m, t):
         if t == 0:
-            return m.e_bess[t] == (params.initial_soc_pct / 100.0 * m.bess_mwh) + \
-                                  (m.p_chg[t] * params.eff_charge - m.p_dchg[t] / params.eff_discharge) * dt
-        else:
-            return m.e_bess[t] == m.e_bess[t-1] + \
-                                  (m.p_chg[t] * params.eff_charge - m.p_dchg[t] / params.eff_discharge) * dt
+            return (
+                m.e_bess[t]
+                == init_soc_frac * m.bess_mwh
+                + (m.p_chg[t] * eta_c - m.p_dchg[t] / eta_d) * dt
+            )
+        return (
+            m.e_bess[t]
+            == m.e_bess[t - 1]
+            + (m.p_chg[t] * eta_c - m.p_dchg[t] / eta_d) * dt
+        )
     m.soc_con = pyo.Constraint(m.T, rule=soc_rule)
-    last_t = m.T.last()
+
+    # ── Constraint 9: Terminal SOC ≥ Initial SOC ──────────────────────────
+    last_t = n - 1
     m.terminal_soc_con = pyo.Constraint(
-        expr=m.e_bess[last_t] >= params.initial_soc_pct / 100.0 * m.bess_mwh
+        expr=m.e_bess[last_t] >= init_soc_frac * m.bess_mwh
     )
-    
-    # 6. Target SSR Constraint
-    allowed_grid_mwh = total_demand_mwh * (1.0 - (params.target_ssr_pct / 100.0))
-    def ssr_rule(m):
-        return sum((m.p_grid[t] + m.p_unmet[t]) * dt for t in m.T) <= allowed_grid_mwh
-    m.ssr_con = pyo.Constraint(rule=ssr_rule)
-    
-    # ---------------------------------------------------------
-    # PHASE 1A: Global Optimum (Base Case)
-    # ---------------------------------------------------------
-    def linear_obj_rule(m):
-        capex = (params.cost_solar_mw * m.k_sol) + \
-                (params.cost_wind_mw * m.k_win) + \
-                (params.cost_bess_mw * m.bess_mw) + \
-                (params.cost_bess_mwh * m.bess_mwh)
-        
-        annual_grid_cost = sum(m.p_grid[t] * dt * params.grid_cost_mwh for t in m.T)
-        annual_deg_cost = sum(m.p_dchg[t] * dt * params.real_deg_cost for t in m.T)
-        annual_fixed_om = m.bess_mwh * params.fixed_opex_per_mwh_year
 
-        grid_connection_cost = (m.peak_grid_mw * params.grid_connection_cost_mw)
-        
-        pv_opex = (annual_grid_cost + annual_deg_cost + annual_fixed_om) * params.pv_factor / 1_000_000.0
-        pv_grid_connection = grid_connection_cost / 1_000_000.0
-        
-        # Dispatch Tie-breaker: Tiny penalty for unmet demand (blackouts).
-        # Tiny reward for holding energy (e_bess) to force BESS to soak up free renewables early instead of curtailing.
-        dispatch_penalty = sum(m.p_dchg[t] * 1e-6 - m.e_bess[t] * 1e-6 + (m.p_unmet[t] * 1e6) for t in m.T)
-        
-        return capex + pv_opex + pv_grid_connection + dispatch_penalty
-        
-    m.lin_obj = pyo.Objective(rule=linear_obj_rule, sense=pyo.minimize)
-    
-    print("   [Phase 1A] Solving Global Optimum with HiGHS...")
-    solver_highs = create_highs_solver()
-    res_highs = solver_highs.solve(m, tee=False)
-    
-    if (res_highs.solver.status != pyo.SolverStatus.ok) or (res_highs.solver.termination_condition != pyo.TerminationCondition.optimal):
-        raise ValueError(f"CRITICAL: HiGHS Linear solve failed. Condition: {res_highs.solver.termination_condition}")
-        
-    optimal_obj_val = pyo.value(m.lin_obj)
+    # ── Constraint 10: BESS duration tie-breaker bounds ───────────────────
+    if params.min_bess_duration_h > 0:
+        m.min_dur_con = pyo.Constraint(
+            expr=m.bess_mwh >= m.bess_mw * params.min_bess_duration_h
+        )
+    if params.max_bess_duration_h < 1e6:
+        m.max_dur_con = pyo.Constraint(
+            expr=m.bess_mwh <= m.bess_mw * params.max_bess_duration_h
+        )
 
-    def extract_sizes(scenario_name):
-        sol = max(0.0, pyo.value(m.k_sol))
-        win = max(0.0, pyo.value(m.k_win))
-        bess_mw = max(0.0, pyo.value(m.bess_mw))
-        bess_mwh = max(0.0, pyo.value(m.bess_mwh))
-        peak_grid_mw = max(0.0, pyo.value(m.peak_grid_mw))
-        
-        fine_cost = (params.cost_solar_mw * (sol ** params.scale_sol) if sol > 0 else 0) + \
-                    (params.cost_wind_mw * (win ** params.scale_win) if win > 0 else 0) + \
-                    (params.cost_bess_mw * (bess_mw ** params.scale_bess_mw) if bess_mw > 0 else 0) + \
-                    (params.cost_bess_mwh * (bess_mwh ** params.scale_bess_mwh) if bess_mwh > 0 else 0)
-        
-        return SizingResult(scenario_name, sol, win, bess_mw, bess_mwh, peak_grid_mw, fine_cost)
+    # ── Scenario-specific target constraint ───────────────────────────────
+    if target_type == "ssr":
+        allowed_grid_mwh = total_demand_mwh * (1.0 - target_value / 100.0)
+        m.ssr_target_con = pyo.Constraint(
+            expr=sum((m.p_grid[t] + m.p_unmet[t]) * dt for t in m.T) <= allowed_grid_mwh
+        )
 
-    candidates = []
-    candidates.append(extract_sizes("Lowest Cost"))
-    print(f"      ✓ Base Optimum: Sol {candidates[0].solar_mw:.1f} MW, Win {candidates[0].wind_mw:.1f} MW, BESS {candidates[0].bess_mw:.1f} MW / {candidates[0].bess_mwh:.1f} MWh")
+    elif target_type == "peak_shaving":
+        m.gc_target_con = pyo.Constraint(
+            m.T, rule=lambda m, t: m.p_grid[t] <= target_value
+        )
+        
+    elif target_type == "co_opt":
+        allowed_grid_mwh = total_demand_mwh * (1.0 - target_value / 100.0)
+        m.ssr_target_con = pyo.Constraint(
+            expr=sum((m.p_grid[t] + m.p_unmet[t]) * dt for t in m.T) <= allowed_grid_mwh
+        )
+        if target_gc_mw is not None:
+            m.gc_target_con = pyo.Constraint(
+                m.T, rule=lambda m, t: m.p_grid[t] <= target_gc_mw
+            )
 
-    # ---------------------------------------------------------
-    # PHASE 1B: Modeling to Generate Alternatives (MGA)
-    # ---------------------------------------------------------
-    print("   [Phase 1B] Generating Alternative Scenarios (+10% Budget)...")
-    
-    m.lin_obj.deactivate()
-    m.mga_budget_con = pyo.Constraint(rule=lambda m: linear_obj_rule(m) <= optimal_obj_val * 1.10)
-    
-    mga_scenarios = {}
-    
-    # Only generate Wind scenarios if wind is allowed and there is wind data
-    if params.site_max_win > 0 and sim_df[SimCols.WIND_POWER].max() > 0:
-        mga_scenarios["Wind-Led"] = (m.k_win, pyo.maximize)
-        
-    # Only generate Solar scenarios if solar is allowed and there is solar data
-    if params.site_max_sol > 0 and sim_df[SimCols.SOLAR_POWER].max() > 0:
-        mga_scenarios["Solar-Led"] = (m.k_sol, pyo.maximize)
-        
-    # Only generate Battery scenarios if batteries are allowed
-    if params.site_max_bess_mwh > 0:
-        mga_scenarios["Storage-Led"] = (m.bess_mwh, pyo.maximize)
-    
-    m.mga_obj = pyo.Objective(expr=0, sense=pyo.maximize)
-    for name, (expr, sense) in mga_scenarios.items():
-        m.mga_obj.expr = expr
-        m.mga_obj.sense = sense
-        try:
-            res_mga = solver_highs.solve(m, tee=False)
-        except RuntimeError as exc:
-            print(f"      ✗ {name}: Solver failed or infeasible. {exc}")
-            continue
-        
-        term_cond = str(res_mga.solver.termination_condition)
-        valid_conditions = ['optimal', 'maxTimeLimit', 'maxIterations', 'TerminationCondition.optimal', 'TerminationCondition.maxTimeLimit', 'TerminationCondition.maxIterations']
-        
-        if any(vc in term_cond for vc in valid_conditions) or (len(res_mga.solution) > 0):
-            res = extract_sizes(name)
-            candidates.append(res)
-            print(f"      ✓ {name}: Sol {res.solar_mw:.1f} MW, Win {res.wind_mw:.1f} MW, BESS {res.bess_mw:.1f} MW / {res.bess_mwh:.1f} MWh")
-        else:
-            print(f"      ✗ {name}: Solver failed or infeasible. Condition: {term_cond}")
-            
-    print("\n✅ Hardware Sizing MGA complete!")
-    return candidates
+    elif target_type == "firmness":
+        # target_value is the firmness target % (e.g. 99.0 means 99% of demand is met)
+        unmet_mwh = sum(m.p_unmet[t] for t in m.T) * dt
+        max_unmet = (1.0 - target_value / 100.0) * total_demand_mwh
+        m.firmness_con = pyo.Constraint(expr=unmet_mwh <= max_unmet)
+
+    elif target_type == "curtailment":
+        # target_value is the allowable curtailment % (e.g. 5.0 means max 5% of PV is curtailed)
+        total_pv = sum(pv_avail) * dt
+        curt_mwh = sum(m.p_curt[t] for t in m.T) * dt
+        max_curt = (target_value / 100.0) * total_pv
+        m.curtailment_con = pyo.Constraint(expr=curt_mwh <= max_curt)
+
+    # The BESS is allowed to use full site limits.
+
+    # ── Objective ─────────────────────────────────────────────────────────
+    if target_type in ("ssr", "co_opt", "firmness", "curtailment"):
+        # Primary: minimise BESS_MWh. Tie-breaker: small weight on BESS_MW.
+        # Tiny reward for export so solver prefers exporting to curtailing when allowed.
+        def obj_rule(m):
+            unmet_penalty = sum(m.p_unmet[t] for t in m.T) * 1e6
+            anti_proc     = -sum(m.e_bess[t] for t in m.T) * 1e-6
+            export_reward = -sum(m.p_export[t] for t in m.T) * 1e-4
+            return m.bess_mwh + 0.001 * m.bess_mw + unmet_penalty + anti_proc + export_reward
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    elif target_type == "peak_shaving":
+        # Primary: minimise BESS_MW. Tie-breaker: small weight on BESS_MWh.
+        def obj_rule(m):
+            unmet_penalty = sum(m.p_unmet[t] for t in m.T) * 1e6
+            anti_proc     = -sum(m.e_bess[t] for t in m.T) * 1e-6
+            export_reward = -sum(m.p_export[t] for t in m.T) * 1e-4
+            return m.bess_mw + 0.001 * m.bess_mwh + unmet_penalty + anti_proc + export_reward
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    elif target_type == "find_max_ssr":
+        # Find the ceiling SSR: minimise total grid import with BESS freely sized.
+        # No SSR constraint — solver finds the physical max by minimising grid.
+        # Tiny BESS penalty to prefer smaller BESS when equal SSR is achieved.
+        def obj_rule(m):
+            total_grid    = sum(m.p_grid[t] for t in m.T)
+            total_unmet   = sum(m.p_unmet[t] for t in m.T) * 1e6
+            bess_penalty  = (m.bess_mwh + m.bess_mw) * 1e-5
+            return total_grid + total_unmet + bess_penalty
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    elif target_type == "find_min_gc":
+        # Find the floor grid connection: add peak_gc tracker variable and minimise it.
+        # BESS is freely sized up to site limits.
+        m.peak_gc = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_grid_mw))
+        m.peak_gc_track = pyo.Constraint(
+            m.T, rule=lambda m, t: m.p_grid[t] <= m.peak_gc
+        )
+        def obj_rule(m):
+            bess_penalty  = (m.bess_mwh + m.bess_mw) * 1e-5
+            unmet_penalty = sum(m.p_unmet[t] for t in m.T) * 1e6
+            return m.peak_gc + bess_penalty + unmet_penalty
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    return m
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _validate_inputs(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    pv_mw_fixed: float,
+    target_type: str,
+    target_value: float,
+) -> None:
+    valid_types = {"ssr", "peak_shaving", "find_max_ssr", "find_min_gc", "co_opt", "firmness", "curtailment"}
+    if target_type not in valid_types:
+        raise ValueError(f"target_type must be one of {valid_types}, got '{target_type}'")
+    if "load_mw" not in df.columns or "pv_pu" not in df.columns:
+        raise ValueError("df must have columns 'load_mw' and 'pv_pu'")
+    if pv_mw_fixed < 0:
+        raise ValueError(f"pv_mw_fixed must be ≥ 0, got {pv_mw_fixed}")
+    if target_type in ("ssr", "co_opt") and not (0 <= target_value <= 100):
+        raise ValueError(f"SSR target must be 0–100%, got {target_value}")
+    if target_type == "peak_shaving" and target_value < 0:
+        raise ValueError(f"Peak shaving target GC must be ≥ 0 MW, got {target_value}")

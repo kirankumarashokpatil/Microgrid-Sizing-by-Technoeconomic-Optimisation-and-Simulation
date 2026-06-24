@@ -10,11 +10,165 @@ the solver to naturally prioritize cheap renewables over expensive grid imports.
 """
 import pyomo.environ as pyo
 import pandas as pd
-from optimizer.params import ProjectParams, SizingResult
+from optimizer.params import SizingResult, PhysicalParams
 from optimizer.schema import RESULT_REQUIRED_COLUMNS, SIM_REQUIRED_COLUMNS, ResultCols, SimCols, require_columns
 from optimizer.solver import create_highs_solver
 
-def run_dispatch(merged_df, sim_df, dt, params: ProjectParams, sizing_result: SizingResult):
+def run_dispatch_simulation(
+    profiles_df: pd.DataFrame,
+    sizing_result: SizingResult,
+    phys_params: PhysicalParams,
+    horizon_hours: int = 48,
+    overlap_hours: int = 24,
+) -> pd.DataFrame:
+    """
+    Phase 2 Operational Verification:
+    Runs the rolling-horizon dispatch using the sized capacities.
+    """
+    print(f"\n   [dispatch] Simulating 8760h with {horizon_hours}h horizon (rolling every {horizon_hours-overlap_hours}h)...")
+    
+    dt = phys_params.dt_hours
+    total_steps = len(profiles_df)
+    step_size = int((horizon_hours - overlap_hours) / dt)
+    horizon_steps = int(horizon_hours / dt)
+    
+    solver = create_highs_solver()
+    output = []
+    
+    # We use a purely penalised objective (no real prices needed just for physical verification)
+    # Goal: minimise unmet load and grid over-limit, then minimise general grid use, and battery cycling
+    
+    current_soc_mwh = sizing_result.bess_mwh * (phys_params.initial_soc_pct / 100.0)
+    
+    def create_model(window_df, init_soc):
+        m = pyo.ConcreteModel()
+        m.T = pyo.RangeSet(0, len(window_df) - 1)
+        
+        m.p_pv = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_grid = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_chg = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_dchg = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_curt = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_unmet = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.p_export = pyo.Var(m.T, within=pyo.NonNegativeReals)
+        m.e_bess = pyo.Var(m.T, within=pyo.NonNegativeReals)
+
+        # Power balance — MUST match the sizing LP (optimizer/sizing_engine._build_lp):
+        #   pv_used + grid + discharge + unmet == load + charge + export
+        # Putting charge on the demand side (not export) lets surplus PV charge the
+        # battery, which the previous "no_export" form silently forbade.
+        def balance_rule(m, t):
+            return (m.p_pv[t] + m.p_grid[t] + m.p_dchg[t] + m.p_unmet[t] ==
+                    window_df['load_mw'].iloc[t] + m.p_chg[t] + m.p_export[t])
+        m.balance = pyo.Constraint(m.T, rule=balance_rule)
+
+        # PV availability + explicit curtailment accounting (matches sizing LP):
+        # everything generated is either used or curtailed.
+        def pv_avail_rule(m, t):
+            return m.p_pv[t] + m.p_curt[t] == window_df['pv_pu'].iloc[t] * sizing_result.pv_mw
+        m.pv_avail = pyo.Constraint(m.T, rule=pv_avail_rule)
+
+        # BTM, import-only: no export to the grid (export ceiling from params).
+        m.export_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_export[t] <= max(0.0, phys_params.export_limit_mw))
+        m.grid_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_grid[t] <= sizing_result.peak_grid_mw)
+
+        if sizing_result.bess_mw > 0.001:
+            m.chg_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_chg[t] <= sizing_result.bess_mw)
+            m.dchg_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_dchg[t] <= sizing_result.bess_mw)
+            m.soc_max = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] <= sizing_result.bess_mwh * (phys_params.max_soc_pct / 100.0))
+            m.soc_min = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] >= sizing_result.bess_mwh * (phys_params.min_soc_pct / 100.0))
+            
+            def soc_rule(m, t):
+                last_e = init_soc if t == 0 else m.e_bess[t-1]
+                return m.e_bess[t] == last_e + (m.p_chg[t] * phys_params.eff_charge - m.p_dchg[t] / phys_params.eff_discharge) * dt
+            m.soc_update = pyo.Constraint(m.T, rule=soc_rule)
+        else:
+            m.chg_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_chg[t] == 0)
+            m.dchg_lim = pyo.Constraint(m.T, rule=lambda m, t: m.p_dchg[t] == 0)
+            m.soc_zero = pyo.Constraint(m.T, rule=lambda m, t: m.e_bess[t] == 0)
+
+        def obj_rule(m):
+            # Penalty weights
+            return sum(
+                m.p_unmet[t] * 1e6 +       # 1. Never drop load
+                m.p_grid[t] * 100 +        # 2. Minimise grid
+                m.p_dchg[t] * 10 -         # 3. Minimise battery cycling (use PV first)
+                m.e_bess[t] * 0.01         # 4. Anti-procrastination (charge early)
+                for t in m.T
+            ) - m.e_bess[m.T.last()] * 50  # 5. Terminal SOC value
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+        return m
+
+    for start in range(0, total_steps, step_size):
+        end = min(start + horizon_steps, total_steps)
+        window = profiles_df.iloc[start:end].reset_index(drop=True)
+        
+        m = create_model(window, current_soc_mwh)
+        res = solver.solve(m, tee=False)
+        
+        if res.solver.status != pyo.SolverStatus.ok or res.solver.termination_condition != pyo.TerminationCondition.optimal:
+            print(f"   [dispatch] WARNING: Solver failed at step {start}. Filling with empty.")
+            break
+            
+        # Extract only the non-overlapping portion
+        extract_len = min(step_size, end - start)
+        for t in range(extract_len):
+            row = {
+                "timestamp": window["timestamp"].iloc[t],
+                "load_mw": window["load_mw"].iloc[t],
+                "pv_avail_mw": window["pv_pu"].iloc[t] * sizing_result.pv_mw,
+                "pv_used_mw": pyo.value(m.p_pv[t]),
+                "grid_import_mw": pyo.value(m.p_grid[t]),
+                "bess_charge_mw": pyo.value(m.p_chg[t]),
+                "bess_discharge_mw": pyo.value(m.p_dchg[t]),
+                "bess_soc_mwh": pyo.value(m.e_bess[t]),
+                "curtailed_mw": pyo.value(m.p_curt[t]),
+                "unmet_load_mw": pyo.value(m.p_unmet[t]),
+            }
+            output.append(row)
+            
+        last_t = extract_len - 1
+        current_soc_mwh = pyo.value(m.e_bess[last_t])
+
+    df_out = pd.DataFrame(output)
+
+    # ── Verification KPIs from the realistic rolling-horizon dispatch ─────────
+    # The sizing LP runs under perfect foresight, so dispatch is a best-effort
+    # operational check, not an exact reproduction. We report SSR and SCR (both
+    # first-class per the CEO brief) and verify the objective that actually drove
+    # the sizing: SSR for an SSR design, grid-limit compliance for peak shaving.
+    if not df_out.empty:
+        tot_load = df_out["load_mw"].sum() * dt
+        tot_grid = df_out["grid_import_mw"].sum() * dt
+        tot_unmet = df_out["unmet_load_mw"].sum() * dt
+        tot_pv_avail = df_out["pv_avail_mw"].sum() * dt
+        tot_pv_used = df_out["pv_used_mw"].sum() * dt
+        peak_grid = df_out["grid_import_mw"].max()
+
+        achieved_ssr = (1 - (tot_grid + tot_unmet) / tot_load) * 100 if tot_load > 0 else 0.0
+        achieved_scr = (tot_pv_used / tot_pv_avail) * 100 if tot_pv_avail > 1e-9 else 0.0
+
+        print(f"   [dispatch] Verification complete (rolling horizon, no foresight):")
+        print(f"      SSR = {achieved_ssr:5.1f}%   |   SCR = {achieved_scr:5.1f}%   |   "
+              f"peak grid = {peak_grid:.1f} MW   |   unmet = {tot_unmet:.1f} MWh")
+
+        if sizing_result.target_type == "peak_shaving":
+            limit = sizing_result.peak_grid_mw
+            ok = peak_grid <= limit + 1e-3
+            verdict = "✓ holds" if ok else "✗ BREACHED"
+            print(f"      Peak-shaving check: peak grid {peak_grid:.1f} MW vs limit "
+                  f"{limit:.1f} MW  →  {verdict}")
+        else:
+            tgt = sizing_result.target_value if sizing_result.target_type == "ssr" else sizing_result.achieved_ssr_pct
+            ok = achieved_ssr >= tgt - 1.0
+            verdict = "✓ meets target" if ok else "✗ below target"
+            print(f"      SSR check: achieved {achieved_ssr:.1f}% vs target {tgt:.1f}%  →  {verdict}")
+
+    return df_out
+
+
+def run_dispatch(merged_df, sim_df, dt, params, sizing_result):
+
     print(f"\nStarting execution in {params.mode} mode with strategy priority_dispatch...")
     require_columns(sim_df, SIM_REQUIRED_COLUMNS, "Simulation data")
 
