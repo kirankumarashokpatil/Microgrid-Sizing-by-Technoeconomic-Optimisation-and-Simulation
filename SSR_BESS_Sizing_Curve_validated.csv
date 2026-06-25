@@ -1,0 +1,11 @@
+SSR target (%),Min BESS Power (MW),Min BESS Energy (MWh),BESS duration (h),Peak grid import (MW),Simulated SSR (Model R) (%),Simulated unmet (MWh),Deliverable BESS (MWh),Physics valid,Viable in simulation
+5.0,0.0,0.0,0.0,88.5,39.6,0.0,0.0,ok,YES
+10.0,0.0,0.0,0.0,88.5,39.6,0.0,0.0,ok,YES
+15.0,0.0,0.0,0.0,88.5,39.6,0.0,0.0,ok,YES
+20.0,0.0,0.0,0.0,88.5,39.6,0.0,0.0,ok,YES
+25.0,0.0,0.0,0.0,88.2,39.6,0.0,0.0,ok,YES
+30.0,0.0,0.0,0.0,88.2,39.6,0.0,0.0,ok,YES
+35.0,0.0,0.0,0.0,88.2,39.6,0.0,0.0,ok,YES
+40.0,3.4,6.8,2.0,82.2,40.0,0.0,6.8,ok,YES
+45.0,62.5,125.1,2.0,82.2,45.0,0.0,125.0,ok,YES
+50.0,76.4,324.5,4.2,82.2,50.0,0.0,323.7,ok,YES
