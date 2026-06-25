@@ -47,18 +47,25 @@ def run_ssr_curve(
     pv_mw_fixed: float,
     scenario_label: str = "Main · SSR Target",
     solver_time_limit: int = 120,
+    ssr_start_pct: float | None = None,
 ) -> pd.DataFrame:
     """
-    Sweep SSR targets from ssr_step to ssr_max and find the minimum BESS
-    (MWh, tie-broken by MW) for each target.
+    Sweep SSR targets from ssr_start (default = one step) up to ssr_max and find
+    the minimum BESS (MWh, tie-broken by MW) for each target.
+
+    ssr_start_pct lets the caller skip the trivial low-SSR region (where the
+    no-battery generation already meets the target, so BESS = 0) and spend the
+    sweep budget where the battery actually does work. Pass the no-battery
+    baseline SSR to start right where storage begins to matter.
 
     Returns
     -------
     pd.DataFrame with CurveCols columns.
     """
+    start = ssr_start_pct if ssr_start_pct is not None else params.ssr_sweep_step_pct
     print(f"\n{'='*65}")
     print(f"  Scenario: {scenario_label}")
-    print(f"  PV fixed at {pv_mw_fixed:.1f} MW  |  Sweep step: {params.ssr_sweep_step_pct:.0f}%")
+    print(f"  PV fixed at {pv_mw_fixed:.1f} MW  |  Sweep {start:.0f}% → max, step {params.ssr_sweep_step_pct:.1f}%")
     print(f"{'='*65}")
 
     # Step 1: find the maximum reachable SSR with this PV
@@ -67,17 +74,15 @@ def run_ssr_curve(
     ssr_max = find_ssr_max(df, params, pv_mw_fixed, solver_time_limit)
     print(f"  → SSR_max = {ssr_max:.1f}%  ({time.time()-t0:.1f}s)")
 
-    if ssr_max < params.ssr_sweep_step_pct:
-        print(f"  ⚠ SSR_max ({ssr_max:.1f}%) < sweep step — no feasible SSR targets.")
+    if ssr_max < start:
+        print(f"  ⚠ SSR_max ({ssr_max:.1f}%) < sweep start ({start:.0f}%) — no feasible SSR targets.")
         return pd.DataFrame(columns=_curve_columns())
 
-    # Step 2: sweep targets from step to ssr_max (exclusive — nothing above max)
-    targets = np.arange(
-        params.ssr_sweep_step_pct,
-        ssr_max,
-        params.ssr_sweep_step_pct,
-    )
+    # Step 2: sweep targets from start to ssr_max (inclusive of the ceiling)
+    targets = list(np.arange(start, ssr_max, params.ssr_sweep_step_pct))
     targets = [round(t, 1) for t in targets]
+    if not targets or abs(targets[-1] - ssr_max) > 0.2:
+        targets.append(round(ssr_max, 1))
 
     print(f"\n  [Step 2/2] Sweeping {len(targets)} SSR targets: "
           f"{targets[0]:.0f}% … {targets[-1]:.0f}%")

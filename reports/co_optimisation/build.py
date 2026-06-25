@@ -21,23 +21,22 @@ sys.path.insert(0, str(REPO))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from optimizer.profile_loader import load_profiles  # noqa: E402
 from optimizer.params import PhysicalParams  # noqa: E402
 from optimizer.sizing_engine import solve_sizing_point, find_ssr_max, find_gc_min  # noqa: E402
 from optimizer.rule_dispatch import verify_sizing_with_rule, validate_flows  # noqa: E402
 from optimizer.schema import KpiKeys  # noqa: E402
-from reports.common import nice_step, hourly_flows, write_block  # noqa: E402
+from reports.common import load_site, nice_step, hourly_flows, write_block  # noqa: E402
 
 
-def derive_bounds(df, p, pv, n_ssr, n_gc):
+def derive_bounds(df, p, pv, n_ssr, n_gc, solver_timeout=120):
     """SSR axis: no-BESS baseline -> find_ssr_max. GC axis: peak demand -> find_gc_min.
     Step chosen from the span and the point budget, rounded to a nice increment."""
     peak_demand = float(df["load_mw"].max())
     base_k, _ = verify_sizing_with_rule(df, p, pv_mw=pv, bess_mw=0.0, bess_mwh=0.0,
                                         target_type="ssr", grid_ceiling_mw=p.site_max_grid_mw)
     ssr_base = base_k[KpiKeys.SSR]
-    ssr_max = find_ssr_max(df, p, pv)
-    gc_min = find_gc_min(df, p, pv)
+    ssr_max = find_ssr_max(df, p, pv, solver_timeout)
+    gc_min = find_gc_min(df, p, pv, solver_timeout)
 
     ssr_lo, ssr_hi = int(np.ceil(ssr_base)), int(np.floor(ssr_max))
     ssr_step = nice_step(ssr_hi - ssr_lo, n_ssr - 1, [1, 2, 5, 10])
@@ -50,12 +49,13 @@ def derive_bounds(df, p, pv, n_ssr, n_gc):
                 peak_demand=peak_demand, gc_min=gc_min, gc_step=gc_step, gc_caps=gc_caps)
 
 
-def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6) -> tuple[Path, Path]:
+def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6,
+          *, dt_hours: float = 1.0, fmt: str = "legacy", solver_timeout: int = 120) -> tuple[Path, Path]:
     import plotly.graph_objects as go
-    df, _, pv = load_profiles(xlsx_path=profiles_path, dt_hours=1.0)
-    p = PhysicalParams(dt_hours=1.0)
+    df, _, pv = load_site(profiles_path, fmt, dt_hours)
+    p = PhysicalParams(dt_hours=dt_hours)
     dt = p.dt_hours
-    b = derive_bounds(df, p, pv, n_ssr, n_gc)
+    b = derive_bounds(df, p, pv, n_ssr, n_gc, solver_timeout)
     SSR_TGTS, GC_CAPS = b["ssr_tgts"], b["gc_caps"]
     print(f"SSR {b['ssr_base']:.1f}->{b['ssr_max']:.1f}% step {b['ssr_step']} => {SSR_TGTS}")
     print(f"GC {b['peak_demand']:.1f}->{b['gc_min']:.1f}MW step {b['gc_step']} => {GC_CAPS}")
@@ -65,7 +65,8 @@ def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6) -> 
     designs = {}
     for j, gc in enumerate(GC_CAPS):
         for i, ssr in enumerate(SSR_TGTS):
-            r = solve_sizing_point(df, p, pv, "co_opt", float(ssr), target_gc_mw=float(gc))
+            r = solve_sizing_point(df, p, pv, "co_opt", float(ssr), target_gc_mw=float(gc),
+                                   solver_time_limit=solver_timeout)
             if not r.feasible:
                 rows.append(dict(SSR_target=ssr, GC_cap=gc, LP_feasible="NO", BESS_MW=None, BESS_MWh=None,
                                  Sim_SSR=None, Sim_peak=None, Sim_unmet=None, Meets_both="infeasible (LP)"))
@@ -86,7 +87,8 @@ def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6) -> 
     flat = pd.DataFrame(rows)
     grid = pd.DataFrame(Z, index=[f"SSR {s}%" for s in SSR_TGTS], columns=[f"GC<={g}MW" for g in GC_CAPS])
 
-    html = out_dir / "CoOpt_SSR_GC_surface_3d.html"
+    suffix = "_BESS15min" if fmt == "bess" else ""
+    html = out_dir / f"CoOpt_SSR_GC_surface_3d{suffix}.html"
     fig = go.Figure(go.Surface(x=GC_CAPS, y=SSR_TGTS, z=Z, colorscale="Viridis",
                                colorbar=dict(title="BESS MWh"),
                                hovertemplate="GC<=%{x} MW<br>SSR %{y}%<br>BESS %{z} MWh<extra></extra>"))
@@ -96,7 +98,7 @@ def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6) -> 
                       height=750, margin=dict(l=0, r=0, t=40, b=0))
     fig.write_html(html, include_plotlyjs="cdn")
 
-    out = out_dir / "CoOpt_SSR_GC_Report.xlsx"
+    out = out_dir / f"CoOpt_SSR_GC_Report{suffix}.xlsx"
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         pd.DataFrame({
             "Bound (derived from the data, not hardcoded)": [
@@ -138,12 +140,19 @@ def build(profiles_path: Path, out_dir: Path, n_ssr: int = 5, n_gc: int = 6) -> 
 
 def main():
     ap = argparse.ArgumentParser(description="Joint SSR + GC co-optimisation report")
-    ap.add_argument("--profiles", default=str(REPO / "8760_PV&Load Profiles.xlsx"))
+    ap.add_argument("--input", choices=["legacy", "bess"], default="legacy",
+                    help="legacy=hourly PV+Load 8760; bess=15-min solar+wind+load")
+    ap.add_argument("--profiles", default=None)
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent))
+    ap.add_argument("--dt", type=float, default=None, help="timestep (h); default 1.0 legacy / 0.25 bess")
     ap.add_argument("--n-ssr", type=int, default=5)
     ap.add_argument("--n-gc", type=int, default=6)
+    ap.add_argument("--solver-timeout", type=int, default=None, help="HiGHS limit/solve (s); default 120 legacy / 600 bess")
     a = ap.parse_args()
-    build(Path(a.profiles), Path(a.out), a.n_ssr, a.n_gc)
+    dt = a.dt if a.dt else (0.25 if a.input == "bess" else 1.0)
+    timeout = a.solver_timeout if a.solver_timeout else (600 if a.input == "bess" else 120)
+    profiles = a.profiles or str(REPO / ("BESS_Input.xlsx" if a.input == "bess" else "8760_PV&Load Profiles.xlsx"))
+    build(Path(profiles), Path(a.out), a.n_ssr, a.n_gc, dt_hours=dt, fmt=a.input, solver_timeout=timeout)
 
 
 if __name__ == "__main__":

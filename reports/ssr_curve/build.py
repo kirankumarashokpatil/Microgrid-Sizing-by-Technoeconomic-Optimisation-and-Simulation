@@ -25,12 +25,20 @@ from reports.common import load_site, hourly_flows, energy_split, monthly, write
 
 
 def build(profiles_path: Path, out_dir: Path, *, dt_hours: float = 1.0,
-          fmt: str = "legacy", ssr_step: float = 5.0, solver_timeout: int = 120) -> Path:
+          fmt: str = "legacy", ssr_step: float = 5.0, ssr_start: float | None = None,
+          min_dur: float = 2.0, max_dur: float = 8.0, solver_timeout: int = 120) -> Path:
     df, _, pv = load_site(profiles_path, fmt, dt_hours)
-    p = PhysicalParams(dt_hours=dt_hours, ssr_sweep_step_pct=ssr_step)
+    p = PhysicalParams(dt_hours=dt_hours, ssr_sweep_step_pct=ssr_step,
+                       min_bess_duration_h=min_dur, max_bess_duration_h=max_dur)
     dt = p.dt_hours
+    # Data-driven sweep start: skip the trivial region below the no-battery baseline
+    # SSR (where BESS = 0), so the fine step is spent where storage actually matters.
+    if ssr_start is None:
+        bk, _ = verify_sizing_with_rule(df, p, pv_mw=pv, bess_mw=0.0, bess_mwh=0.0,
+                                        target_type="ssr", grid_ceiling_mw=p.site_max_grid_mw)
+        ssr_start = float(int(bk[KpiKeys.SSR]))   # floor of baseline SSR
     curve = run_ssr_curve(df, p, pv_mw_fixed=pv, scenario_label="Main SSR sizing",
-                          solver_time_limit=solver_timeout)
+                          solver_time_limit=solver_timeout, ssr_start_pct=ssr_start)
     feas = curve[curve[CurveCols.FEASIBLE] == True]
 
     def sim(mw, mwh):
@@ -116,12 +124,16 @@ def main():
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent))
     ap.add_argument("--dt", type=float, default=None, help="timestep (h); default 1.0 legacy / 0.25 bess")
     ap.add_argument("--ssr-step", type=float, default=5.0)
+    ap.add_argument("--ssr-start", type=float, default=None, help="sweep start %% (default = no-battery baseline SSR)")
+    ap.add_argument("--min-duration", type=float, default=2.0, help="min BESS E/P (h)")
+    ap.add_argument("--max-duration", type=float, default=8.0, help="max BESS E/P (h); raise for long-lull sites")
     ap.add_argument("--solver-timeout", type=int, default=None, help="HiGHS limit/solve (s); default 120 legacy / 600 bess")
     a = ap.parse_args()
     dt = a.dt if a.dt else (0.25 if a.input == "bess" else 1.0)
     timeout = a.solver_timeout if a.solver_timeout else (600 if a.input == "bess" else 120)
     profiles = a.profiles or str(REPO / ("BESS_Input.xlsx" if a.input == "bess" else "8760_PV&Load Profiles.xlsx"))
-    build(Path(profiles), Path(a.out), dt_hours=dt, fmt=a.input, ssr_step=a.ssr_step, solver_timeout=timeout)
+    build(Path(profiles), Path(a.out), dt_hours=dt, fmt=a.input, ssr_step=a.ssr_step,
+          ssr_start=a.ssr_start, min_dur=a.min_duration, max_dur=a.max_duration, solver_timeout=timeout)
 
 
 if __name__ == "__main__":
