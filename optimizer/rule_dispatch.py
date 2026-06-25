@@ -273,6 +273,70 @@ class RuleSizingResult:
     feasible: bool
 
 
+def _smallest_meeting(
+    predicate,
+    lo: float,
+    hi: float,
+    tol: float,
+    max_iter: int,
+    *,
+    n_guard: int = 6,
+    n_scan: int = 64,
+) -> tuple[float, dict]:
+    """
+    Smallest x in (lo, hi] for which predicate(x) is True, where predicate is
+    EXPECTED monotone — False below a threshold, True above — and returns
+    (bool, kpis). Assumes predicate(hi) is already known True.
+
+    Monotonicity guard (review item #5): the rule is monotone in BESS size in
+    practice, but bisection is contract-critical, so we never *assume* it. A few
+    samples across the range are checked for the False*→True* pattern; if it's
+    violated, we fall back to a fine scan and return the smallest x that meets AND
+    stays meeting for every larger sampled size. A non-monotone rule therefore
+    can never silently hand back a too-small battery — at worst it costs a slower
+    scan. Predicate calls are memoised so the guard adds no full-year sims it
+    can avoid.
+    """
+    cache: dict[float, tuple[bool, dict]] = {}
+
+    def p(x: float) -> tuple[bool, dict]:
+        key = round(x, 4)
+        if key not in cache:
+            cache[key] = predicate(x)
+        return cache[key]
+
+    # Guard: sample evenly and look for the expected False*→True* shape.
+    xs = [lo + (hi - lo) * i / (n_guard - 1) for i in range(n_guard)]
+    flags = [p(x)[0] for x in xs]
+    first_true = next((i for i, f in enumerate(flags) if f), None)
+    monotone = first_true is not None and all(flags[first_true:])
+
+    if not monotone:
+        # Conservative fine scan: smallest grid point that meets and never stops
+        # meeting above. Guarantees a valid (not undersized) result.
+        step = (hi - lo) / n_scan
+        grid = [lo + step * i for i in range(n_scan + 1)]
+        gflags = [p(x)[0] for x in grid]
+        for i, x in enumerate(grid):
+            if all(gflags[i:]):
+                return x, p(x)[1]
+        return hi, p(hi)[1]
+
+    # Monotone → bisect.
+    blo, bhi = lo, hi
+    k_best = p(hi)[1]
+    for _ in range(max_iter):
+        if bhi - blo <= tol:
+            break
+        mid = 0.5 * (blo + bhi)
+        ok, k = p(mid)
+        if ok:
+            bhi, k_best = mid, k
+        else:
+            blo = mid
+    return bhi, k_best
+
+
 def size_by_bisection(
     profiles_df: pd.DataFrame,
     params: PhysicalParams,
@@ -280,35 +344,54 @@ def size_by_bisection(
     pv_mw: float,
     target_type: str,            # "ssr" | "peak_shaving"
     target_value: float,         # SSR % (ssr) | grid ceiling MW (peak_shaving)
-    duration_h: float = 4.0,     # E/P ratio used to derive MWh from MW
+    duration_h: float = 4.0,     # E/P ratio for the SSR objective (energy-driven)
     grid_ceiling_mw: float | None = None,   # for ssr: the import ceiling (site max)
     max_bess_mw: float | None = None,
     tol_mw: float = 0.5,
     max_iter: int = 30,
 ) -> RuleSizingResult:
     """
-    Find the minimum BESS power (MW, at fixed E/P duration) that meets the target
-    when operated by the causal rule. BESS size → SSR (and → lower peak) is
-    monotone, so a clean bisection converges in ~log2(range/tol) rule-sims.
+    Minimum BESS that meets the target when operated by the causal rule (Model R)
+    — the operationally-honest size reported alongside the LP lower bound.
 
-    This is the operationally-honest sizing number (Model R), to be reported
-    alongside the LP lower bound (Model O).
+    Sizing differs by objective:
+
+      ssr           : energy-driven. Couple MWh = MW · duration_h and bisect MW.
+                      SSR rises monotonically with stored energy.
+
+      peak_shaving  : MW and MWh are sized SEPARATELY (review item #4). A peak's
+                      instantaneous over-ceiling deficit sets the POWER floor; a
+                      sustained excursion sets the ENERGY floor — coupling them at
+                      one fixed E/P over-sizes whichever isn't binding. We first
+                      find the min MW with energy made generous (max-duration), so
+                      power is the binding constraint, then shrink MWh at that MW
+                      down to the min that still holds the ceiling, clamped to the
+                      2–8h E/P band.
+
+    Both paths size through _smallest_meeting, which carries the monotonicity
+    guard (review item #5).
     """
     max_bess_mw = max_bess_mw if max_bess_mw is not None else params.site_max_bess_mw
     ceiling = grid_ceiling_mw if grid_ceiling_mw is not None else params.site_max_grid_mw
     if target_type == "peak_shaving":
         ceiling = target_value
 
-    # Dispatch policy: SSR targets maximise self-sufficiency; peak-shaving targets
-    # reserve charge for peaks. The no-PV sub-scenario must grid-charge to shave
-    # at all (DESIGN_REVIEW.md §1, open item #4) — gated ONLY there.
-    rule_mode = "peak_shaving" if target_type == "peak_shaving" else "self_sufficiency"
-    grid_charge = (rule_mode == "peak_shaving") and (pv_mw <= 1e-9)
+    min_dur = params.min_bess_duration_h
+    max_dur = params.max_bess_duration_h
 
-    def meets(bess_mw: float) -> tuple[bool, dict]:
+    # Dispatch policy: SSR targets maximise self-sufficiency ("grid as last
+    # resort" — never grid-charge). Peak-shaving targets minimise the connection
+    # MW with energy unconstrained, so off-peak valley-fill (Grid → BESS from the
+    # headroom below the ceiling) is the mechanism, not a violation — enabled for
+    # ALL peak-shaving runs, with or without PV (the spec allows Grid → BESS when
+    # load < grid). Was previously gated to the no-PV sub-scenario only.
+    rule_mode = "peak_shaving" if target_type == "peak_shaving" else "self_sufficiency"
+    grid_charge = (rule_mode == "peak_shaving")
+
+    def meets(bess_mw: float, bess_mwh: float) -> tuple[bool, dict]:
         flows = run_rule_dispatch(
             profiles_df, params,
-            pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mw * duration_h,
+            pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
             grid_ceiling_mw=ceiling, mode=rule_mode, allow_grid_charge=grid_charge,
         )
         k = compute_flow_kpis(flows, params.dt_hours)
@@ -319,29 +402,44 @@ def size_by_bisection(
             return k[KpiKeys.TOTAL_UNMET_LOAD] <= 1e-6, k
         raise ValueError(f"unknown target_type {target_type!r}")
 
-    # Is the target even reachable at max BESS?
-    ok_hi, k_hi = meets(max_bess_mw)
+    # ── SSR objective — energy-driven, couple MWh to MW at the requested duration
+    if target_type == "ssr":
+        m = lambda mw: meets(mw, mw * duration_h)
+        ok_hi, k_hi = m(max_bess_mw)
+        if not ok_hi:
+            return RuleSizingResult(pv_mw, max_bess_mw, max_bess_mw * duration_h,
+                                    ceiling, k_hi, feasible=False)
+        ok_lo, k_lo = m(0.0)
+        if ok_lo:
+            return RuleSizingResult(pv_mw, 0.0, 0.0, ceiling, k_lo, feasible=True)
+        mw, k_best = _smallest_meeting(m, 0.0, max_bess_mw, tol_mw, max_iter)
+        return RuleSizingResult(pv_mw, mw, mw * duration_h, ceiling, k_best, feasible=True)
+
+    # ── Peak-shaving objective — size MW and MWh independently ──────────────────
+    # Step 1: minimum POWER. Give the battery generous energy (max duration) so
+    # the binding constraint is power, not energy.
+    mp = lambda mw: meets(mw, mw * max_dur)
+    ok_hi, k_hi = mp(max_bess_mw)
     if not ok_hi:
-        return RuleSizingResult(pv_mw, max_bess_mw, max_bess_mw * duration_h, ceiling, k_hi, feasible=False)
-
-    # Does it need any BESS at all?
-    ok_lo, k_lo = meets(0.0)
-    if ok_lo:
+        return RuleSizingResult(pv_mw, max_bess_mw,
+                                min(max_bess_mw * max_dur, params.site_max_bess_mwh),
+                                ceiling, k_hi, feasible=False)
+    ok_lo, k_lo = mp(0.0)
+    if ok_lo:   # load never breaches the ceiling — no battery needed
         return RuleSizingResult(pv_mw, 0.0, 0.0, ceiling, k_lo, feasible=True)
+    mw, _ = _smallest_meeting(mp, 0.0, max_bess_mw, tol_mw, max_iter)
 
-    lo, hi = 0.0, max_bess_mw
-    k_best = k_hi
-    for _ in range(max_iter):
-        if hi - lo <= tol_mw:
-            break
-        mid = 0.5 * (lo + hi)
-        ok, k = meets(mid)
-        if ok:
-            hi, k_best = mid, k
-        else:
-            lo = mid
+    # Step 2: minimum ENERGY at that power, clamped to the 2–8h E/P band.
+    lo_e, hi_e = mw * min_dur, mw * max_dur
+    if meets(mw, lo_e)[0]:
+        # Energy not binding even at min duration → take the band floor (min MWh).
+        mwh, k_best = lo_e, meets(mw, lo_e)[1]
+    else:
+        me = lambda mwh: meets(mw, mwh)
+        mwh, k_best = _smallest_meeting(me, lo_e, hi_e, max(1.0, tol_mw), max_iter)
 
-    return RuleSizingResult(pv_mw, hi, hi * duration_h, ceiling, k_best, feasible=True)
+    mwh = min(mwh, params.site_max_bess_mwh)
+    return RuleSizingResult(pv_mw, mw, mwh, ceiling, k_best, feasible=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -366,12 +464,13 @@ def verify_sizing_with_rule(
     Operate a fixed (already-sized) design under the causal rule and return
     (kpis, flows). The flows are validated against the physics invariants.
 
-    Mode/grid-charge follow the same policy as size_by_bisection: SSR designs
-    run self-sufficiency; peak-shaving designs reserve charge for peaks; the
-    no-PV sub-scenario is allowed to grid-charge (and nothing else is).
+    Mode/grid-charge follow the same policy as size_by_bisection: SSR designs run
+    self-sufficiency (never grid-charge); peak-shaving designs reserve charge for
+    peaks and may off-peak valley-fill (Grid → BESS below the ceiling), with or
+    without PV.
     """
     mode = _mode_for(target_type)
-    grid_charge = (mode == "peak_shaving") and (pv_mw <= 1e-9)
+    grid_charge = (mode == "peak_shaving")
     flows = run_rule_dispatch(
         profiles_df, params,
         pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
@@ -442,4 +541,108 @@ def attach_operational_kpis(
     out[CurveCols.OP_GRID_MWH]   = op_grid
     out[CurveCols.OP_UNMET_MWH]  = op_unmet
     out[CurveCols.OP_SSR_GAP_PP] = op_gap
+    return out
+
+
+def attach_rule_sizing(
+    curve_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+    params: PhysicalParams,
+) -> pd.DataFrame:
+    """
+    For every feasible row of an LP (Model O) sizing curve, compute the
+    DELIVERABLE size: the minimum BESS that actually meets the row's target
+    under the causal contract dispatch (Model R), at the same E/P duration as
+    the LP point. Then gross that up for ~20yr capacity fade to give the
+    end-of-life-honest day-one install.
+
+    The LP BESS_MW/MWh is an optimistic lower bound — operate that battery under
+    the rule and it misses the target (see attach_operational_kpis' SSR gap).
+    This overlay answers "what do I actually buy?", which is the CEO's question.
+
+    Adds columns:
+      R_BESS_MW / R_BESS_MWH  — deliverable day-one size (meets target under rule)
+      R_FEASIBLE              — False if target unreachable under the rule at site max
+      EOL_BESS_MW / EOL_BESS_MWH — deliverable size grossed up for end of life
+      EOL_CAPPED              — True if the EoL gross-up hit the site BESS limit
+
+    Only grid-connected BTM scenarios are sized (off-grid F / standalone G have
+    different grid semantics); other topologies get blank columns.
+    """
+    if curve_df is None or curve_df.empty:
+        return curve_df
+
+    n = len(curve_df)
+    r_mw   = [None] * n
+    r_mwh  = [None] * n
+    r_feas = [None] * n
+    e_mw   = [None] * n
+    e_mwh  = [None] * n
+    e_cap  = [None] * n
+
+    grid_btm = getattr(params, "site_topology", "grid_connected_btm") == "grid_connected_btm"
+    retention = params.eol_retention_fraction
+
+    if grid_btm:
+        for i, (_, row) in enumerate(curve_df.iterrows()):
+            feasible = bool(row.get(CurveCols.FEASIBLE, False))
+            if not feasible:
+                continue
+
+            target_type = row.get(CurveCols.TARGET_TYPE, "ssr")
+            pv_mw = float(row.get(CurveCols.PV_MW, 0) or 0)
+
+            # Map the curve target onto size_by_bisection's two target types.
+            # co_opt sizes to the SSR target while holding the GC ceiling.
+            if target_type == "peak_shaving":
+                bis_type = "peak_shaving"
+                target_value = float(row.get(CurveCols.TARGET_GC_MW, 0) or 0)
+                ceiling = None
+            elif target_type in ("ssr", "co_opt"):
+                bis_type = "ssr"
+                target_value = float(row.get(CurveCols.TARGET_SSR_PCT, 0) or 0)
+                gc = row.get(CurveCols.TARGET_GC_MW, None)
+                ceiling = float(gc) if (gc is not None and not pd.isna(gc)) else None
+            else:
+                # firmness / curtailment are non-BTM — skip
+                continue
+
+            # Match the LP point's E/P; fall back to a mid-band duration if the
+            # LP point carried no battery (duration 0) or sits outside the band.
+            dur = float(row.get(CurveCols.BESS_DURATION_H, 0) or 0)
+            if not (params.min_bess_duration_h <= dur <= params.max_bess_duration_h):
+                dur = max(params.min_bess_duration_h,
+                          min(4.0, params.max_bess_duration_h))
+
+            res = size_by_bisection(
+                profiles_df, params,
+                pv_mw=pv_mw,
+                target_type=bis_type,
+                target_value=target_value,
+                duration_h=dur,
+                grid_ceiling_mw=ceiling,
+            )
+
+            r_mw[i]   = round(res.bess_mw, 2)
+            r_mwh[i]  = round(res.bess_mwh, 2)
+            r_feas[i] = bool(res.feasible)
+
+            # End-of-life gross-up: install bigger day-one so the faded pack still
+            # meets the target. Keep duration constant (gross MW and MWh equally),
+            # capped at the physical site limits.
+            raw_mw  = res.bess_mw  / retention
+            raw_mwh = res.bess_mwh / retention
+            cap_mw  = min(raw_mw,  params.site_max_bess_mw)
+            cap_mwh = min(raw_mwh, params.site_max_bess_mwh)
+            e_mw[i]  = round(cap_mw, 2)
+            e_mwh[i] = round(cap_mwh, 2)
+            e_cap[i] = bool(cap_mw < raw_mw - 1e-6 or cap_mwh < raw_mwh - 1e-6)
+
+    out = curve_df.copy()
+    out[CurveCols.R_BESS_MW]    = r_mw
+    out[CurveCols.R_BESS_MWH]   = r_mwh
+    out[CurveCols.R_FEASIBLE]   = r_feas
+    out[CurveCols.EOL_BESS_MW]  = e_mw
+    out[CurveCols.EOL_BESS_MWH] = e_mwh
+    out[CurveCols.EOL_CAPPED]   = e_cap
     return out

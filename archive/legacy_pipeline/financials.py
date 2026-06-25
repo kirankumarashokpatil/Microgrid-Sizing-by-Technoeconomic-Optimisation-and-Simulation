@@ -8,7 +8,8 @@ tax assumptions, discount rates, or LCOE formulas without risking breaking the
 core dispatch logic.
 """
 import pandas as pd
-from optimizer.params import ProjectParams, SizingResult
+from archive.legacy_pipeline.legacy_params import ProjectParams
+from optimizer.params import SizingResult
 from optimizer.schema import KpiKeys, RESULT_REQUIRED_COLUMNS, ResultCols, require_columns
 
 def calculate_financials(res_df: pd.DataFrame, dt: float, sizing_result: SizingResult, params: ProjectParams, kpi_dict: dict):

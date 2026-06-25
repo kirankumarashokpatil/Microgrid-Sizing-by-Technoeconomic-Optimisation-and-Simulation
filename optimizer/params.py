@@ -37,6 +37,13 @@ class PhysicalParams:
     min_bess_duration_h: float = 2.0    # minimum BESS duration (MWh/MW)
     max_bess_duration_h: float = 8.0    # maximum BESS duration (MWh/MW)
 
+    # ── Degradation (~20yr end of life) ──────────────────────────────────
+    # Usable BESS energy retained at end of life as a fraction of day-one
+    # nameplate (spec: size so the target still holds at EoL). e.g. 80 → a
+    # day-one 100 MWh pack delivers 80 MWh of usable capacity at year ~20, so
+    # the EoL-honest install is grossed up by 1 / 0.80.
+    eol_capacity_retention_pct: float = 80.0
+
     # ── Site Hard Limits ─────────────────────────────────────────────────
     site_max_bess_mw: float  = 500.0    # physical site cap on BESS power (MW)
     site_max_bess_mwh: float = 4000.0   # physical site cap on BESS energy (MWh)
@@ -63,6 +70,11 @@ class PhysicalParams:
     def usable_soc_fraction(self) -> float:
         """Alias for dod_fraction — fraction of MWh that is usable."""
         return self.dod_fraction
+
+    @property
+    def eol_retention_fraction(self) -> float:
+        """End-of-life usable-capacity retention as a fraction (0–1)."""
+        return max(0.01, min(1.0, self.eol_capacity_retention_pct / 100.0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,11 +108,6 @@ class EconomicParams:
     project_lifespan_years: float    = 20.0
     off_take_tariff_mwh: float       = 0.0
 
-    # Nonlinear scale factors (kept for backward compat with legacy sizing)
-    scale_pv: float      = 1.0
-    scale_bess_mw: float = 1.0
-    scale_bess_mwh: float = 1.0
-
     # ── Derived Properties ────────────────────────────────────────────────
     @property
     def real_discount_rate(self) -> float:
@@ -124,91 +131,6 @@ class EconomicParams:
         if self.cycle_life <= 0 or dod <= 0:
             return 0.0
         return self.replacement_cost_mwh / (self.cycle_life * dod)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LEGACY — ProjectParams
-# Kept for backward compatibility with the existing config_loader / dispatch /
-# financials pipeline (Phase 2 full run with project config Excel).
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ProjectParams:
-    """
-    Legacy combined parameter object used by the Phase 2 full pipeline
-    (config_loader → sizing_engine → dispatch → financials → reporter).
-    Not used in Phase 1 curve generation.
-    """
-    # General Config
-    horizon_hours: int
-    time_resolution_hours: float
-    mode: str
-    rolling_step_hours: int
-
-    # BESS Physics
-    eff_charge: float
-    eff_discharge: float
-    initial_soc_pct: float
-    min_soc_pct: float
-    max_soc_pct: float
-    cycle_life: int
-    replacement_cost_mwh: float
-
-    # Economics
-    grid_cost_mwh: float
-    grid_connection_cost_mw: float
-    nominal_discount_rate_pct: float
-    inflation_rate_pct: float
-    fixed_opex_per_mwh_year: float
-    project_lifespan_years: float
-    off_take_tariff_mwh: float
-    degradation_cost_mwh: float | None
-
-    # Hardware Costs
-    cost_solar_mw: float
-    cost_wind_mw: float
-    cost_bess_mw: float
-    cost_bess_mwh: float
-    scale_sol: float
-    scale_win: float
-    scale_bess_mw: float
-    scale_bess_mwh: float
-
-    # Site Constraints
-    target_ssr_pct: float
-    site_max_sol: float
-    site_max_win: float
-    site_max_bess_mw: float
-    site_max_bess_mwh: float
-    site_max_grid_mw: float
-    min_bess_duration_hours: float
-    max_bess_duration_hours: float
-
-    @property
-    def dod_fraction(self) -> float:
-        return (self.max_soc_pct - self.min_soc_pct) / 100.0
-
-    @property
-    def real_discount_rate(self) -> float:
-        return (
-            (1 + self.nominal_discount_rate_pct / 100.0)
-            / (1 + self.inflation_rate_pct / 100.0) - 1
-        ) * 100.0
-
-    @property
-    def real_deg_cost(self) -> float:
-        if self.degradation_cost_mwh is not None:
-            return self.degradation_cost_mwh
-        if self.cycle_life <= 0 or self.dod_fraction <= 0:
-            return 0.0
-        return self.replacement_cost_mwh / (self.cycle_life * self.dod_fraction)
-
-    @property
-    def pv_factor(self) -> float:
-        r = self.real_discount_rate / 100.0
-        if r <= 0:
-            return self.project_lifespan_years
-        return sum(1 / (1 + r) ** t for t in range(1, int(self.project_lifespan_years) + 1))
 
 
 # ──────────────────────────────────────────────────────────────────────────────

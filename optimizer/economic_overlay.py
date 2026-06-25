@@ -46,6 +46,29 @@ def _ssr_of(row) -> float:
     return float(row.get(CurveCols.ACHIEVED_SSR_PCT, 0) or 0)
 
 
+def _costed_size(row) -> tuple[float, float]:
+    """
+    The BESS (MW, MWh) to put a price on: the end-of-life install you actually
+    buy (EOL_*), falling back to the deliverable Model R size (R_*), then the LP
+    lower bound (Model O) for curves produced before deliverable/EoL sizing
+    existed. Mirrors _ssr_of — always prefer the honest, operable number.
+
+    Costing the LP size understates CAPEX, fixed O&M and land, and ranks the
+    optimum on a battery smaller than the one that meets the target. This routes
+    every cost site onto the size that reaches the IC pack.
+    """
+    for mw_col, mwh_col in (
+        (CurveCols.EOL_BESS_MW, CurveCols.EOL_BESS_MWH),
+        (CurveCols.R_BESS_MW,   CurveCols.R_BESS_MWH),
+        (CurveCols.BESS_MW,     CurveCols.BESS_MWH),
+    ):
+        mwh = row.get(mwh_col, None)
+        if mwh is not None and not pd.isna(mwh):
+            mw = row.get(mw_col, None)
+            return float(mw or 0.0), float(mwh)
+    return 0.0, 0.0
+
+
 def _baseline_ssr(feasible_df: pd.DataFrame) -> float:
     """
     No-BESS self-consumption SSR — the PV-direct baseline used to estimate how
@@ -150,8 +173,9 @@ def evaluate_costs(
 
     rows = []
     for _, row in feasible.iterrows():
-        bess_mw  = float(row.get(CurveCols.BESS_MW,  0) or 0)
-        bess_mwh = float(row.get(CurveCols.BESS_MWH, 0) or 0)
+        # Cost the size you actually buy (EoL install / deliverable), not the LP
+        # lower bound. See _costed_size.
+        bess_mw, bess_mwh = _costed_size(row)
         pv_mw    = float(row.get(CurveCols.PV_MW,    0) or 0)
         gc_mw    = float(row.get(CurveCols.PEAK_GC_MW, 0) or 0)
         ssr      = _ssr_of(row)   # operational (Model R) SSR when available
@@ -192,6 +216,10 @@ def evaluate_costs(
         npv           = -(total_pvc)   # cost-only NPV (no revenue assumed in base case)
 
         r = row.to_dict()
+        # Make the priced size explicit in the workbook (may differ from the LP
+        # BESS_MW/MWh columns — this is the EoL install that was costed).
+        r["Costed BESS Power (MW)"]   = round(bess_mw, 2)
+        r["Costed BESS Energy (MWh)"] = round(bess_mwh, 2)
         r["CAPEX PV (€M)"]            = round(capex_pv / 1e6, 3)
         r["CAPEX BESS MW (€M)"]       = round(capex_bess_mw / 1e6, 3)
         r["CAPEX BESS MWh (€M)"]      = round(capex_bess_mwh / 1e6, 3)
@@ -266,8 +294,11 @@ def find_optimal_point(
         # Zero-battery points are "free" PV self-consumption (marginal cost ≈ 0),
         # and including them makes the knee collapse onto the no-storage design —
         # which is never a meaningful storage recommendation.
-        bess_col = CurveCols.BESS_MW
-        engaged = feasible[feasible.get(bess_col, 0).fillna(0) > 0.1].copy() if bess_col in feasible.columns else feasible
+        # Engaged = designs that actually deploy storage, judged by the COSTED
+        # (EoL/deliverable) size, falling back to the LP size for older curves.
+        bess_col = "Costed BESS Power (MW)" if "Costed BESS Power (MW)" in feasible.columns else CurveCols.BESS_MW
+        engaged = (feasible[pd.to_numeric(feasible.get(bess_col, 0), errors="coerce").fillna(0) > 0.1].copy()
+                   if bess_col in feasible.columns else feasible)
         if engaged.empty:
             # No design uses storage at all — fall back to the cheapest point.
             result = feasible.loc[feasible[cap_col].idxmin()] if cap_col in feasible.columns else feasible.iloc[0]
@@ -448,8 +479,9 @@ def analyse_grid_services(
     dict
         Key grid services metrics and economics.
     """
-    bess_mw  = float(optimal_sizing.get(CurveCols.BESS_MW,  0) or 0)
-    bess_mwh = float(optimal_sizing.get(CurveCols.BESS_MWH, 0) or 0)
+    # Reserve services capacity from the battery you actually install (EoL/
+    # deliverable), not the LP bound.
+    bess_mw, bess_mwh = _costed_size(optimal_sizing)
 
     if bess_mw <= 0:
         return {
@@ -529,7 +561,10 @@ def check_site_area(
 
     df = costed_df.copy()
     pv_col   = CurveCols.PV_MW
-    bess_col = CurveCols.BESS_MWH
+    # Land is for the battery you install (EoL/deliverable), not the LP bound.
+    bess_col = ("Costed BESS Energy (MWh)" if "Costed BESS Energy (MWh)" in df.columns
+                else (CurveCols.EOL_BESS_MWH if CurveCols.EOL_BESS_MWH in df.columns
+                      else CurveCols.BESS_MWH))
 
     pv_mw    = pd.to_numeric(df.get(pv_col,   0), errors="coerce").fillna(0)
     bess_mwh = pd.to_numeric(df.get(bess_col, 0), errors="coerce").fillna(0)

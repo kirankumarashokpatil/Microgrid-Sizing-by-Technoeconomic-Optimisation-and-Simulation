@@ -10,7 +10,10 @@ for backward compatibility with the Phase 2 dispatch pipeline.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 2 — Dispatch simulation column names (unchanged)
+# LEGACY column names — used ONLY by archive/legacy_pipeline (the superseded
+# Phase-2 full pipeline). The live engine uses CurveCols + FlowCols + KpiKeys
+# below. Kept here so the archived modules still import; safe to delete once the
+# archive is dropped.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SimCols:
@@ -89,6 +92,24 @@ class CurveCols:
     OP_GRID_MWH      = "Operational Grid Import (MWh)"
     OP_UNMET_MWH     = "Operational Unmet (MWh)"
     OP_SSR_GAP_PP    = "SSR Gap O−R (pp)"
+
+    # Deliverable size (Model R). The BESS_MW/MWh columns above are the LP lower
+    # bound (Model O) — the smallest battery that COULD hit the target with perfect
+    # foresight. These are the smallest battery that ACTUALLY hits the target under
+    # the causal contract dispatch, at the same E/P duration. This is the number to
+    # buy. R_FEASIBLE is False when the target is unreachable under the rule even at
+    # the site's maximum BESS.
+    R_BESS_MW        = "Deliverable BESS Power (MW · Model R)"
+    R_BESS_MWH       = "Deliverable BESS Energy (MWh · Model R)"
+    R_FEASIBLE       = "Target Met Under Rule"
+
+    # End-of-life sizing. The deliverable size grossed up so the target still holds
+    # at ~20yr after capacity fade (spec: "oversize day-one so target met at EoL").
+    # This is the day-one nameplate to install. EOL_CAPPED flags when the gross-up
+    # exceeds the site's physical BESS limit.
+    EOL_BESS_MW      = "EoL-Sized BESS Power (MW)"
+    EOL_BESS_MWH     = "EoL-Sized BESS Energy (MWh)"
+    EOL_CAPPED       = "EoL Size Capped by Site Limit"
 
     # Phase 2 overlay (added later — not populated by Phase 1)
     CAPEX_M          = "CAPEX (€M)"

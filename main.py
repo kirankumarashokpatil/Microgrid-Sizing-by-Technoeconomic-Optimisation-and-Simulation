@@ -74,6 +74,10 @@ def parse_args():
     p.add_argument("--resample-15min", action="store_true",
                    help="Run at 15-min resolution. Requires NATIVE 15-min profiles; "
                         "errors on hourly data (peaks are not fabricated by interpolation).")
+    p.add_argument("--eol-retention", type=float, default=80.0,
+                   help="BESS usable-capacity retained at ~20yr end of life (%%). "
+                        "Deliverable sizes are grossed up by 1/this so the target "
+                        "still holds at EoL. Default: 80")
 
     # ── Phase 2 args ──────────────────────────────────────────────────────
     p.add_argument("--curves", default=str(_DEFAULT_CURVES),
@@ -159,6 +163,7 @@ def run_phase1(args):
         site_max_bess_mw=500.0, site_max_bess_mwh=4000.0, site_max_grid_mw=200.0,
         ssr_sweep_step_pct=args.ssr_step,
         gc_sweep_step_mw=args.gc_step,
+        eol_capacity_retention_pct=args.eol_retention,
     )
 
     import copy
@@ -219,7 +224,7 @@ def run_phase1(args):
     # ── Operational verification (Model R) on every curve point ───────────────
     # Attach the causal-rule SSR/SCR/peak/unmet next to the LP lower bound, plus
     # the O−R gap, so each curve carries both numbers (DESIGN_REVIEW.md §1).
-    from optimizer.rule_dispatch import attach_operational_kpis
+    from optimizer.rule_dispatch import attach_operational_kpis, attach_rule_sizing
     print("\n  [Model R] Verifying every curve point under the causal rule …")
     # Grid-connected BTM scenarios only. F (off-grid) and G (standalone export)
     # have different grid semantics and keep LP columns only.
@@ -228,6 +233,18 @@ def run_phase1(args):
     curve_c = attach_operational_kpis(curve_c, df, params)
     curve_d = attach_operational_kpis(curve_d, df, params)
     curve_e = attach_operational_kpis(curve_e, df, params)
+
+    # ── Deliverable sizing (Model R) + end-of-life gross-up ───────────────────
+    # The LP size is an optimistic lower bound; re-size each point to actually
+    # meet its target under the causal rule, then oversize for ~20yr fade so the
+    # target still holds at end of life. These are the numbers to buy.
+    print(f"  [Model R] Sizing deliverable BESS + EoL gross-up "
+          f"(retention {params.eol_capacity_retention_pct:.0f}%) …")
+    curve_a = attach_rule_sizing(curve_a, df, params)
+    curve_b = attach_rule_sizing(curve_b, df, params)
+    curve_c = attach_rule_sizing(curve_c, df, params)
+    curve_d = attach_rule_sizing(curve_d, df, params)
+    curve_e = attach_rule_sizing(curve_e, df, params)
 
     save_phase1_report(
         output_path=args.output,

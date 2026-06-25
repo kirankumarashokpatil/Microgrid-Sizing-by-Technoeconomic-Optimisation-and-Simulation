@@ -24,3 +24,15 @@ venv.bak/
 
 # Documents
 *.pdf
+
+# Generated outputs (regenerable from the optimiser; keep out of version control)
+plot_*.html
+plot_*.png
+Phase1_Sizing_Curves.xlsx
+Phase2_TechnoEconomic.xlsx
+Phase2_Dispatch_Verification.xlsx
+archive/plot_*.html
+archive/plot_*.png
+archive/Phase1_Sizing_Curves.xlsx
+archive/Phase2_TechnoEconomic.xlsx
+archive/Phase2_Dispatch_Verification.xlsx
