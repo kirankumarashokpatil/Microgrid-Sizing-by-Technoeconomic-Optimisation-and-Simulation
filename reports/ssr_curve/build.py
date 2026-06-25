@@ -17,19 +17,20 @@ sys.path.insert(0, str(REPO))
 
 import pandas as pd  # noqa: E402
 
-from optimizer.profile_loader import load_profiles  # noqa: E402
 from optimizer.params import PhysicalParams  # noqa: E402
 from optimizer.curve_runner import run_ssr_curve  # noqa: E402
 from optimizer.rule_dispatch import verify_sizing_with_rule, validate_flows, size_by_bisection  # noqa: E402
 from optimizer.schema import CurveCols, KpiKeys  # noqa: E402
-from reports.common import hourly_flows, energy_split, monthly, write_block  # noqa: E402
+from reports.common import load_site, hourly_flows, energy_split, monthly, write_block  # noqa: E402
 
 
-def build(profiles_path: Path, out_dir: Path, ssr_step: float = 5.0) -> Path:
-    df, _, pv = load_profiles(xlsx_path=profiles_path, dt_hours=1.0)
-    p = PhysicalParams(dt_hours=1.0, ssr_sweep_step_pct=ssr_step)
+def build(profiles_path: Path, out_dir: Path, *, dt_hours: float = 1.0,
+          fmt: str = "legacy", ssr_step: float = 5.0, solver_timeout: int = 120) -> Path:
+    df, _, pv = load_site(profiles_path, fmt, dt_hours)
+    p = PhysicalParams(dt_hours=dt_hours, ssr_sweep_step_pct=ssr_step)
     dt = p.dt_hours
-    curve = run_ssr_curve(df, p, pv_mw_fixed=pv, scenario_label="Main SSR sizing")
+    curve = run_ssr_curve(df, p, pv_mw_fixed=pv, scenario_label="Main SSR sizing",
+                          solver_time_limit=solver_timeout)
     feas = curve[curve[CurveCols.FEASIBLE] == True]
 
     def sim(mw, mwh):
@@ -42,7 +43,8 @@ def build(profiles_path: Path, out_dir: Path, ssr_step: float = 5.0) -> Path:
             ok = False
         return k, flows, ok
 
-    out = out_dir / "SSR_Scenarios_Report.xlsx"
+    suffix = "_BESS15min" if fmt == "bess" else ""
+    out = out_dir / f"SSR_Scenarios_Report{suffix}.xlsx"
     summary, made = [], {}
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         pd.DataFrame({"_": []}).to_excel(w, sheet_name="Summary", index=False)
@@ -108,11 +110,18 @@ def build(profiles_path: Path, out_dir: Path, ssr_step: float = 5.0) -> Path:
 
 def main():
     ap = argparse.ArgumentParser(description="SSR sizing-curve report")
-    ap.add_argument("--profiles", default=str(REPO / "8760_PV&Load Profiles.xlsx"))
+    ap.add_argument("--input", choices=["legacy", "bess"], default="legacy",
+                    help="legacy=hourly PV+Load 8760; bess=15-min solar+wind+load")
+    ap.add_argument("--profiles", default=None)
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent))
+    ap.add_argument("--dt", type=float, default=None, help="timestep (h); default 1.0 legacy / 0.25 bess")
     ap.add_argument("--ssr-step", type=float, default=5.0)
+    ap.add_argument("--solver-timeout", type=int, default=None, help="HiGHS limit/solve (s); default 120 legacy / 600 bess")
     a = ap.parse_args()
-    build(Path(a.profiles), Path(a.out), a.ssr_step)
+    dt = a.dt if a.dt else (0.25 if a.input == "bess" else 1.0)
+    timeout = a.solver_timeout if a.solver_timeout else (600 if a.input == "bess" else 120)
+    profiles = a.profiles or str(REPO / ("BESS_Input.xlsx" if a.input == "bess" else "8760_PV&Load Profiles.xlsx"))
+    build(Path(profiles), Path(a.out), dt_hours=dt, fmt=a.input, ssr_step=a.ssr_step, solver_timeout=timeout)
 
 
 if __name__ == "__main__":

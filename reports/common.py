@@ -15,6 +15,23 @@ from optimizer.schema import FlowCols, KpiKeys
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Input loading — pick the file format
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_site(profiles_path, fmt: str, dt_hours: float):
+    """Return (df, load_nameplate, generation_nameplate) for the chosen format.
+
+    fmt="legacy" → hourly 8760 PV+Load file (load_profiles).
+    fmt="bess"   → 15-min solar+wind+load file, generation = solar+wind
+                   (load_bess_input).
+    """
+    from optimizer.profile_loader import load_profiles, load_bess_input
+    if fmt == "bess":
+        return load_bess_input(profiles_path, dt_hours=dt_hours)
+    return load_profiles(xlsx_path=profiles_path, dt_hours=dt_hours)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sweep helpers
 # ──────────────────────────────────────────────────────────────────────────────
 

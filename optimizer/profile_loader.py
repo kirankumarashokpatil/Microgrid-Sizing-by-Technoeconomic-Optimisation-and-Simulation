@@ -173,6 +173,68 @@ def _validate_profiles(df: pd.DataFrame, load_nameplate: float, pv_nameplate: fl
         raise ValueError("NaN values remain in profile DataFrame after cleaning.")
 
 
+def load_bess_input(
+    xlsx_path: str | Path,
+    dt_hours: float = 0.25,
+) -> tuple[pd.DataFrame, float, float]:
+    """
+    Loader for the 'BESS_Input.xlsx' format (sheet 'Energy Timeseries'):
+      date_time | solar_power_mw | wind_power_mw | Data center MW
+    All columns are absolute MW at 15-minute resolution.
+
+    Solar and wind are summed into ONE total generation profile. That combined
+    generation (absolute MW) is returned as a per-unit profile normalised to its
+    own peak, so pv_pu ∈ [0,1] and pv_avail = pv_pu × gen_nameplate reproduces the
+    actual combined output in MW. The engine is generation-agnostic, so wind+solar
+    is just a different generation array — no engine change needed.
+
+    Returns (df[timestamp, load_mw, pv_pu], load_nameplate_mw, gen_nameplate_mw),
+    where gen_nameplate_mw is the peak combined generation (used as pv_mw_fixed).
+    """
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Profile file not found: {xlsx_path}")
+
+    raw = pd.read_excel(xlsx_path, sheet_name="Energy Timeseries")
+    solar = pd.to_numeric(raw["solar_power_mw"], errors="coerce").fillna(0.0)
+    wind  = pd.to_numeric(raw["wind_power_mw"],  errors="coerce").fillna(0.0)
+
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(raw["date_time"], errors="coerce"),
+        "load_mw":   pd.to_numeric(raw["Data center MW"], errors="coerce"),
+        "gen_mw":    (solar + wind).clip(lower=0.0),     # total generation (MW)
+    }).dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    df["load_mw"] = df["load_mw"].fillna(0.0)
+
+    gen_nameplate = float(df["gen_mw"].max())
+    df["pv_pu"] = (df["gen_mw"] / gen_nameplate).clip(0.0, 1.0) if gen_nameplate > 1e-9 else 0.0
+    load_nameplate = float(np.ceil(df["load_mw"].max()))
+
+    # Never fabricate finer resolution than the data has (same guard as load_profiles).
+    if len(df) >= 3:
+        native_dt_h = df["timestamp"].diff().dropna().median().total_seconds() / 3600.0
+    else:
+        native_dt_h = dt_hours
+    if dt_hours < native_dt_h - 1e-6:
+        raise ValueError(
+            f"Requested timestep {dt_hours:g} h is finer than the data's native "
+            f"resolution {native_dt_h:g} h. Supply native {dt_hours:g} h data or "
+            f"run at dt_hours={native_dt_h:g}."
+        )
+
+    out = df[["timestamp", "load_mw", "pv_pu"]].copy()
+    _validate_profiles(out, load_nameplate, gen_nameplate)
+
+    print(f"   [load_bess_input] {len(out)} steps  |  dt = {dt_hours} h  "
+          f"|  Load peak {load_nameplate:.0f} MW  |  Gen (solar+wind) peak {gen_nameplate:.1f} MW")
+    print(f"   [load_bess_input] Load → min {out['load_mw'].min():.1f}, "
+          f"max {out['load_mw'].max():.1f}, mean {out['load_mw'].mean():.1f} MW")
+    print(f"   [load_bess_input] Annual load {out['load_mw'].sum()*dt_hours:,.0f} MWh  |  "
+          f"annual generation {df['gen_mw'].sum()*dt_hours:,.0f} MWh "
+          f"(ratio {df['gen_mw'].sum()/out['load_mw'].sum():.2f})")
+    return out, load_nameplate, gen_nameplate
+
+
 def compute_annual_energy(df: pd.DataFrame, dt_hours: float = 1.0) -> dict:
     """
     Convenience helper — returns key annual energy totals from the profiles.
