@@ -36,3 +36,8 @@ archive/plot_*.png
 archive/Phase1_Sizing_Curves.xlsx
 archive/Phase2_TechnoEconomic.xlsx
 archive/Phase2_Dispatch_Verification.xlsx
+
+# Per-scenario report outputs (regenerate via reports/<scenario>/build.py)
+reports/**/*.xlsx
+reports/**/*.html
+reports/**/*.csv
