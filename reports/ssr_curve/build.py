@@ -27,10 +27,11 @@ from reports.common import load_site, hourly_flows, energy_split, monthly, write
 def build(profiles_path: Path, out_dir: Path, *, dt_hours: float = 1.0,
           fmt: str = "legacy", ssr_step: float = 5.0, ssr_start: float | None = None,
           n_points: int | None = None, min_dur: float = 2.0, max_dur: float = 8.0,
-          solver_timeout: int = 120) -> Path:
+          init_soc: float = 50.0, solver_timeout: int = 120) -> Path:
     df, _, pv = load_site(profiles_path, fmt, dt_hours)
     p = PhysicalParams(dt_hours=dt_hours, ssr_sweep_step_pct=ssr_step,
-                       min_bess_duration_h=min_dur, max_bess_duration_h=max_dur)
+                       min_bess_duration_h=min_dur, max_bess_duration_h=max_dur,
+                       initial_soc_pct=init_soc)
     dt = p.dt_hours
     # Data-driven sweep start: skip the trivial region below the no-battery baseline
     # SSR (where BESS = 0). With n_points, the same number of targets is then placed
@@ -132,6 +133,7 @@ def main():
     ap.add_argument("--ssr-start", type=float, default=None, help="sweep start %% (default = no-battery baseline SSR)")
     ap.add_argument("--min-duration", type=float, default=2.0, help="min BESS E/P (h)")
     ap.add_argument("--max-duration", type=float, default=8.0, help="max BESS E/P (h); raise for long-lull sites")
+    ap.add_argument("--init-soc", type=float, default=50.0, help="initial = terminal-floor SOC (%%)")
     ap.add_argument("--solver-timeout", type=int, default=None, help="HiGHS limit/solve (s); default 120 legacy / 600 bess")
     a = ap.parse_args()
     dt = a.dt if a.dt else (0.25 if a.input == "bess" else 1.0)
@@ -139,7 +141,7 @@ def main():
     profiles = a.profiles or str(REPO / ("BESS_Input.xlsx" if a.input == "bess" else "8760_PV&Load Profiles.xlsx"))
     build(Path(profiles), Path(a.out), dt_hours=dt, fmt=a.input, ssr_step=a.ssr_step,
           ssr_start=a.ssr_start, n_points=a.n_points, min_dur=a.min_duration,
-          max_dur=a.max_duration, solver_timeout=timeout)
+          max_dur=a.max_duration, init_soc=a.init_soc, solver_timeout=timeout)
 
 
 if __name__ == "__main__":
