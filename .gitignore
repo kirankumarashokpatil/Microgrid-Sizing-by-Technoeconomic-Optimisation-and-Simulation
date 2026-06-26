@@ -41,3 +41,10 @@ archive/Phase2_Dispatch_Verification.xlsx
 reports/**/*.xlsx
 reports/**/*.html
 reports/**/*.csv
+
+# Stale root-level generated outputs (regenerable)
+CoOpt_SSR_GC_Report.xlsx
+CoOpt_SSR_GC_surface_3d.html
+SSR_*.xlsx
+SSR_*.html
+GC_*.xlsx
