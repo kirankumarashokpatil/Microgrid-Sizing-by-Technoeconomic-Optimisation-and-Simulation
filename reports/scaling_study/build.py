@@ -56,7 +56,8 @@ def write_input(hourly: pd.DataFrame, gen_scale: float, load_scale: float, path:
 def main():
     ap = argparse.ArgumentParser(description="PV/demand scaling study (hourly)")
     ap.add_argument("--src", default=str(REPO / "BESS_Input.xlsx"))
-    ap.add_argument("--ssr-step", type=float, default=10.0)
+    ap.add_argument("--n-points", type=int, default=6,
+                    help="SSR targets per variant, evenly across each [baseline, SSR_max] band")
     a = ap.parse_args()
 
     base_dir = Path(__file__).resolve().parent
@@ -76,7 +77,7 @@ def main():
         outdir.mkdir(parents=True, exist_ok=True)
         print(f"\n{'='*60}\n  {name}:  generation x{g}   demand x{l}\n{'='*60}")
         xlsx = build_ssr(inp, outdir, dt_hours=1.0, fmt="bess",
-                         ssr_step=a.ssr_step, solver_timeout=120)
+                         n_points=a.n_points, solver_timeout=120)
         # rename the generic output to a variant-clear name
         nice = outdir / f"SSR_{name}.xlsx"
         Path(xlsx).replace(nice)

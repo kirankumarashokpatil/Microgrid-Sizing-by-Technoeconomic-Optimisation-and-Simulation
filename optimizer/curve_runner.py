@@ -48,6 +48,7 @@ def run_ssr_curve(
     scenario_label: str = "Main · SSR Target",
     solver_time_limit: int = 120,
     ssr_start_pct: float | None = None,
+    n_points: int | None = None,
 ) -> pd.DataFrame:
     """
     Sweep SSR targets from ssr_start (default = one step) up to ssr_max and find
@@ -58,14 +59,20 @@ def run_ssr_curve(
     sweep budget where the battery actually does work. Pass the no-battery
     baseline SSR to start right where storage begins to matter.
 
+    n_points, if given, places exactly that many targets EVENLY across the
+    feasible band [ssr_start, ssr_max] — so every scenario is sampled at the same
+    resolution regardless of how wide its band is (the defensible default). Else
+    a fixed step (ssr_sweep_step_pct) is used.
+
     Returns
     -------
     pd.DataFrame with CurveCols columns.
     """
     start = ssr_start_pct if ssr_start_pct is not None else params.ssr_sweep_step_pct
+    mode = f"{n_points} points across band" if n_points else f"step {params.ssr_sweep_step_pct:.1f}%"
     print(f"\n{'='*65}")
     print(f"  Scenario: {scenario_label}")
-    print(f"  PV fixed at {pv_mw_fixed:.1f} MW  |  Sweep {start:.0f}% → max, step {params.ssr_sweep_step_pct:.1f}%")
+    print(f"  PV fixed at {pv_mw_fixed:.1f} MW  |  Sweep {start:.0f}% → max, {mode}")
     print(f"{'='*65}")
 
     # Step 1: find the maximum reachable SSR with this PV
@@ -78,9 +85,13 @@ def run_ssr_curve(
         print(f"  ⚠ SSR_max ({ssr_max:.1f}%) < sweep start ({start:.0f}%) — no feasible SSR targets.")
         return pd.DataFrame(columns=_curve_columns())
 
-    # Step 2: sweep targets from start to ssr_max (inclusive of the ceiling)
-    targets = list(np.arange(start, ssr_max, params.ssr_sweep_step_pct))
-    targets = [round(t, 1) for t in targets]
+    # Step 2: build the target list — either N points across the feasible band
+    # (consistent resolution per scenario) or a fixed step up to the ceiling.
+    if n_points and n_points >= 2:
+        targets = list(np.linspace(start, ssr_max, n_points))
+    else:
+        targets = list(np.arange(start, ssr_max, params.ssr_sweep_step_pct))
+    targets = sorted(set(round(t, 1) for t in targets))
     if not targets or abs(targets[-1] - ssr_max) > 0.2:
         targets.append(round(ssr_max, 1))
 
