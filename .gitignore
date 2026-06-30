@@ -48,3 +48,24 @@ CoOpt_SSR_GC_surface_3d.html
 SSR_*.xlsx
 SSR_*.html
 GC_*.xlsx
+
+# ── Frontend (Vite + React) ──────────────────────────────────────────────────
+# Dependencies (reinstall from package-lock.json)
+node_modules/
+# Build / bundler output (regenerable via `npm run build`)
+frontend/dist/
+dist/
+build/
+# Vite + tooling caches
+.vite/
+**/.vite/
+*.tsbuildinfo
+.eslintcache
+# Local env overrides
+.env.local
+.env.*.local
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

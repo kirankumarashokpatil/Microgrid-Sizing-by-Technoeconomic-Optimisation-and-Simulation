@@ -1,0 +1,120 @@
+{
+  "version": "1.0.0",
+  "name": "dip_scenario_wizard",
+  "description": "Question tree that routes a business question to one scenario ID. Each option either points to the next question (next) or ends at a scenario (leaf). Leaf nodes carry ONLY scenario_id; the backend annotates status/name/needs from the live registry, so the tree can never drift from the engine.",
+  "start": "Q1",
+  "questions": {
+    "Q1": {
+      "text": "What type of system are you modelling?",
+      "options": [
+        {"label": "Generation + BESS + Load (behind-the-meter)", "next": "Q2A"},
+        {"label": "BESS + Load only (no on-site generation)", "next": "Q2B"},
+        {"label": "Off-grid system", "next": "Q2C"},
+        {"label": "Standalone generation system", "next": "Q2D"}
+      ]
+    },
+
+    "Q2A": {
+      "text": "What do you want the tool to do for this BTM system?",
+      "options": [
+        {"label": "Evaluate a fixed design", "next": "Q3A1"},
+        {"label": "Size the battery", "next": "Q3A2"},
+        {"label": "Size PV and battery together", "next": "Q3A3"},
+        {"label": "Verify a design under real operation", "next": "Q3A4"}
+      ]
+    },
+    "Q3A1": {
+      "text": "What kind of fixed-design answer do you need?",
+      "options": [
+        {"label": "KPI summary (and time-series flows)", "leaf": "S00_FIXED_DESIGN_EVAL"},
+        {"label": "Minimum grid connection for this fixed design", "leaf": "S52_BTM_GCMIN_FIXED_DESIGN"}
+      ]
+    },
+    "Q3A2": {
+      "text": "What is the main sizing target?",
+      "options": [
+        {"label": "Self-sufficiency target (SSR)", "next": "Q4A2a"},
+        {"label": "Grid connection target (GC)", "next": "Q4A2b"},
+        {"label": "Both SSR and grid connection together", "next": "Q4A2c"}
+      ]
+    },
+    "Q4A2a": {
+      "text": "For SSR sizing, what answer shape do you want?",
+      "options": [
+        {"label": "One battery size for one SSR target", "leaf": "S11_BTM_SSR_TARGET_BESS"},
+        {"label": "Full curve across many SSR targets", "leaf": "S21_BTM_SSR_CURVE"}
+      ]
+    },
+    "Q4A2b": {
+      "text": "For grid-connection sizing, what answer shape do you want?",
+      "options": [
+        {"label": "One battery size for one GC target", "leaf": "S12_BTM_GC_TARGET_BESS"},
+        {"label": "Full curve across many GC targets", "leaf": "S22_BTM_GC_CURVE"},
+        {"label": "Lowest achievable grid connection", "leaf": "S51_BTM_GCMIN_BESSOPT"}
+      ]
+    },
+    "Q4A2c": {
+      "text": "For joint SSR + GC sizing, is PV size fixed or also solved?",
+      "options": [
+        {"label": "PV size is fixed", "leaf": "S71_BTM_SSR_PLUS_GC_BESS"},
+        {"label": "PV size should also be solved", "leaf": "S72_BTM_PVBESS_SSR_PLUS_GC"}
+      ]
+    },
+    "Q3A3": {
+      "text": "Sizing PV and battery together — which target?",
+      "options": [
+        {"label": "SSR target", "next": "Q4A3"},
+        {"label": "Grid connection target", "next": "Q5A3b"},
+        {"label": "Both SSR and GC together", "leaf": "S72_BTM_PVBESS_SSR_PLUS_GC"}
+      ]
+    },
+    "Q4A3": {
+      "text": "For PV + BESS with an SSR target, what answer shape?",
+      "options": [
+        {"label": "One design point", "leaf": "S61_BTM_PVBESS_SSR_TARGET"},
+        {"label": "Full PV–BESS surface", "leaf": "S62_BTM_PVBESS_SSR_SURFACE"}
+      ]
+    },
+    "Q5A3b": {
+      "text": "For PV + BESS with a grid target, what answer shape?",
+      "options": [
+        {"label": "One design point", "leaf": "S63_BTM_PVBESS_GC_TARGET"},
+        {"label": "Full PV–BESS surface", "leaf": "S64_BTM_PVBESS_GC_SURFACE"}
+      ]
+    },
+    "Q3A4": {
+      "text": "What kind of operational check do you want?",
+      "options": [
+        {"label": "Verify KPIs for a fixed design under causal operation", "leaf": "S41_OPERATIONAL_VERIFY"},
+        {"label": "Re-size to a deliverable battery under real operation", "leaf": "S42_DELIVERABLE_BESS_SIZE"}
+      ]
+    },
+
+    "Q2B": {
+      "text": "What do you want the tool to do for a BESS + Load system?",
+      "options": [
+        {"label": "Evaluate a fixed battery design", "leaf": "S33_SUB_FIXED_BESS_EVAL"},
+        {"label": "Size battery for a grid connection target", "leaf": "S31_SUB_GC_TARGET_BESS"},
+        {"label": "Full battery-vs-grid curve", "leaf": "S32_SUB_GC_CURVE"},
+        {"label": "Size battery for backup firmness", "leaf": "S34_SUB_FIRMNESS_TARGET_BESS"},
+        {"label": "Grid curve excluding under-utilised batteries", "leaf": "S35_SUB_UTILISATION_BESS_CURVE"}
+      ]
+    },
+
+    "Q2C": {
+      "text": "What do you want to solve for an off-grid system?",
+      "options": [
+        {"label": "Minimum PV + BESS for a firmness target", "leaf": "S91_OFFGRID_FIRMNESS_PVBESS"},
+        {"label": "Minimum generation for off-grid reliability", "leaf": "S92_OFFGRID_GENMIN"}
+      ]
+    },
+
+    "Q2D": {
+      "text": "What do you want to solve for a standalone generation system?",
+      "options": [
+        {"label": "Battery size for an export-limited curtailment target", "leaf": "S93_STANDALONE_EXPORTLIMIT_BESS"},
+        {"label": "Generation sizing under export constraint", "leaf": "S94_STANDALONE_GENSIZE_EXPORTLIMIT"}
+      ]
+    }
+  }
+}

@@ -177,14 +177,18 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
         KpiKeys.GCMIN_PEAK: res.peak_grid_mw,
     }
     notes = ""
-    # Honest operational check under the causal rule (cheap, on-brief).
+    flows = None
+    # Honest operational check under the causal rule (cheap, on-brief). We keep
+    # the flows it produces so a point design can be SEEN operating over the year
+    # (energy provenance, dispatch on the peak day, when the grid is used) — not
+    # just reported as scalars.
     if res.feasible and ctx.params.site_topology == "grid_connected_btm":
         from optimizer.rule_dispatch import verify_sizing_with_rule
         ttype = "peak_shaving" if res.target_type == "peak_shaving" else "ssr"
         ceiling = (res.target_value if res.target_type == "peak_shaving"
                    else ctx.params.site_max_grid_mw)
         try:
-            opk, _ = verify_sizing_with_rule(
+            opk, flows = verify_sizing_with_rule(
                 ctx.profiles_df, ctx.params,
                 pv_mw=res.pv_mw, bess_mw=res.bess_mw, bess_mwh=res.bess_mwh,
                 target_type=ttype, grid_ceiling_mw=ceiling,
@@ -195,9 +199,11 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
             kpis[KpiKeys.TOTAL_UNMET_LOAD] = opk[KpiKeys.TOTAL_UNMET_LOAD]
             notes = "KPIs are operational (Model R); LP is the lower bound."
         except Exception:
+            flows = None
             notes = "LP KPIs only (operational verify unavailable)."
     return ScenarioResult(spec.id, spec.name, "point", spec.status,
-                          feasible=res.feasible, design=design, kpis=kpis, notes=notes)
+                          feasible=res.feasible, design=design, kpis=kpis,
+                          flows=flows, notes=notes)
 
 
 def _h_point_ssr(spec, ctx):
