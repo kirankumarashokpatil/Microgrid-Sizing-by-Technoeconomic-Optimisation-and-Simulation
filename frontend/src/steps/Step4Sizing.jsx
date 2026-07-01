@@ -39,7 +39,7 @@ export function Step4Sizing({ cfg, profile, summary, result, setResult,
   // the Step-2 radio button values. This wires the actual flow topology → backend.
   const sig = cfg.topoSignals || {};
   const genOn = cfg.tech.solar || cfg.tech.wind;
-  const availPv = cfg.parcel?.maxSolarMw ?? summary?.pv_nameplate_mw ?? 150;
+  const availPv = cfg.parcels?.solar?.maxMw ?? summary?.pv_nameplate_mw ?? 150;
 
   // PV: prefer the FlowDesigner's summed solar rated_mw, else parcel nameplate.
   const pvMw = sig.pv_mw != null
@@ -49,7 +49,7 @@ export function Step4Sizing({ cfg, profile, summary, result, setResult,
   // Wind: from FlowDesigner signal or parcel.
   const windMw = sig.wind_mw != null
     ? sig.wind_mw
-    : (cfg.topology === "backup" || !cfg.tech.wind) ? 0 : (cfg.parcel?.maxWindMw ?? 0);
+    : (cfg.topology === "backup" || !cfg.tech.wind) ? 0 : (cfg.parcels?.wind?.maxMw ?? 0);
 
   // Derive topology booleans: FlowDesigner is authoritative when available.
   const gridAvail = sig.grid_available != null

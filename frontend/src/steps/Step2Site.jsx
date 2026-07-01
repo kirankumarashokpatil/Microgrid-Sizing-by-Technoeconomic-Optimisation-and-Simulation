@@ -45,10 +45,17 @@ export function Step2Site({ cfg, patch, step, go }) {
 
       {drawsParcel && (
         <div className="card">
-          <h3>Land parcel → available generation</h3>
-          <div className="hint">Draw the buildable land. Its area sets the maximum installable solar/wind — the
-            <b style={{ color: "var(--teal-dark)" }}> available generation</b> the engine sizes the battery against.</div>
-          <LandParcel tech={cfg.tech} onChange={(p) => patch({ parcel: { ...cfg.parcel, ...p } })} />
+          <h3>Land parcels → available generation</h3>
+          <div className="hint">Draw a <b>separate</b> buildable parcel for each generation technology — solar and wind
+            compete for land, so each has its own area and its own maximum nameplate the engine sizes against.</div>
+          {cfg.tech.solar && (
+            <div style={{ marginBottom: cfg.tech.wind ? 18 : 0 }}>
+              <LandParcel kind="solar" onChange={(p) => patch({ parcels: { ...cfg.parcels, solar: p } })} />
+            </div>
+          )}
+          {cfg.tech.wind && (
+            <LandParcel kind="wind" onChange={(p) => patch({ parcels: { ...cfg.parcels, wind: p } })} />
+          )}
         </div>
       )}
 

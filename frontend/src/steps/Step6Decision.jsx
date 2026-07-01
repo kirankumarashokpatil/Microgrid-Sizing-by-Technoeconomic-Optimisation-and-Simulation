@@ -1,25 +1,38 @@
 // Step 6 — Decision pack. IC/lender-ready output for the recommended design:
 // KPI tiles, economics, CAPEX breakdown, the real dispatch chart from the
 // forward-eval flows, and value vs a 100%-grid baseline.
+import { useState } from "react";
 import { NeedRun } from "./shared.jsx";
 import { column, exportXlsx } from "../lib/api.js";
 import { linePath, areaPath, downsample, fmt } from "../lib/svg.js";
 
-export function Step6Decision({ cfg, result, flows, step, go }) {
+const TOPO_MAP = { btm: "grid_connected_btm", backup: "bess_load_only", off_grid: "off_grid", standalone: "standalone_gen" };
+
+export function Step6Decision({ cfg, profile, result, flows, step, go }) {
   const eco = result?.economics;
   if (!eco) return <NeedRun go={go} ranInfeasible={!!result} />;
   const rec = eco.recommended, vg = eco.vs_grid_default;
   const curt = result?.kpis?.["OSR / Curtailment (%)"];
+  const [exporting, setExporting] = useState(false);
 
   async function downloadExcel() {
+    setExporting(true);
     try {
+      const loadPeak = (cfg?.loads || []).reduce((s, l) => s + (+l.peak_mw || 0), 0);
       await exportXlsx({
         project_name: cfg?.projectName || "DIP Project",
         scenario_id: result.id, scenario_name: result.name,
         recommended: rec, vs_grid_default: vg, points: eco.points || [],
-        kpis: result.kpis || {}, assumptions: cfg?.econ || {}, flows: flows || null,
+        kpis: result.kpis || {}, assumptions: cfg?.econ || {},
+        // inputs so the backend can re-derive each point's per-slot dispatch
+        profile_path: profile?.profile_path || null,
+        load_peak_mw: loadPeak > 0 ? loadPeak : null,
+        pv_mw: rec.pv_mw, wind_mw: rec.wind_mw,
+        site_topology: TOPO_MAP[cfg?.topology] || "grid_connected_btm",
+        include_timeseries: true,
       });
     } catch (e) { alert("Export failed: " + (e.message || e)); }
+    finally { setExporting(false); }
   }
 
   return (
@@ -70,7 +83,9 @@ export function Step6Decision({ cfg, result, flows, step, go }) {
         <button className="btn" onClick={() => go(step - 1)}>Back</button>
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn" onClick={() => window.print()}>⤓ IC pack (print)</button>
-          <button className="btn primary" onClick={downloadExcel}>⤓ Download Excel (.xlsx)</button>
+          <button className="btn primary" onClick={downloadExcel} disabled={exporting}>
+            {exporting ? "Building workbook…" : "⤓ Download Excel (.xlsx)"}
+          </button>
         </div>
       </div>
     </>

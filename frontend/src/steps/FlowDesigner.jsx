@@ -41,7 +41,7 @@ const DEF_PARAMS = {
 const PF = {
   solar:    [{ k:"rated_mw", lb:"MW" },{ k:"eff_pct", lb:"Eff %" }],
   wind:     [{ k:"rated_mw", lb:"MW" },{ k:"eff_pct", lb:"Eff %" }],
-  bess:     [{ k:"rated_mw", lb:"Power MW" },{ k:"capacity_mwh", lb:"Energy MWh" }],
+  bess:     [],   // BESS power/energy are SOLVED by the engine, not entered here
   grid:     [{ k:"max_export_mw", lb:"Export limit MW" }],
 };
 
@@ -339,19 +339,10 @@ function FlowList({nodes, flows, onToggleFlow, onSetFlowOn, onSetFlowCap, onReor
         </div>
         {exportBlocked
           ?<span style={{fontSize:"10.5px",color:"var(--red)",flexShrink:0,fontWeight:600}}>Blocked</span>
-          :<>
-            <div style={{display:"flex",alignItems:"center",gap:3,flexShrink:0}}>
-              <span style={{fontSize:"10px",color:"var(--grey)"}}>MW</span>
-              <input type="number" value={f.cap_mw} min="0" step="1"
-                style={{width:60,padding:"2px 5px",fontSize:"11px",border:"1px solid var(--line2)",borderRadius:"4px"}}
-                onChange={ev=>onSetFlowCap(f.id,+ev.target.value)}
-                onClick={ev=>ev.stopPropagation()}/>
-            </div>
-            <label className="fd-tog">
+          :<label className="fd-tog">
               <input type="checkbox" checked={f.on} onChange={ev=>onSetFlowOn(f.id,ev.target.checked)}/>
               <span className="fd-tog-t"></span>
-            </label>
-          </>}
+            </label>}
       </div>
     );
   });
@@ -680,8 +671,12 @@ export default function FlowDesigner({cfg, onTopoChange}) {
       </div>
 
       <div style={{marginTop:12}}>
-        <div style={{fontSize:"11px",fontWeight:600,color:"var(--grey)",letterSpacing:".4px",marginBottom:6}}>
-          DISPATCH PRIORITY ORDER <span style={{fontWeight:400}}>— drag to reorder · toggle on/off · set capacity (MW)</span>
+        <div style={{fontSize:"11px",fontWeight:600,color:"var(--grey)",letterSpacing:".4px",marginBottom:2}}>
+          ENERGY FLOWS <span style={{fontWeight:400}}>— toggle on/off to shape the topology</span>
+        </div>
+        <div className="subtle" style={{fontSize:"10.5px",marginBottom:6,fontStyle:"italic"}}>
+          The engine enforces a fixed behind-the-meter dispatch order (direct → charge → discharge → grid), so these
+          flows define the <b>topology</b> (what's connected), not a custom priority.
         </div>
         <FlowList nodes={nodes} flows={flows} onToggleFlow={toggleFlow}
           onSetFlowOn={setFlowOn} onSetFlowCap={setFlowCap} onReorder={reorder}/>

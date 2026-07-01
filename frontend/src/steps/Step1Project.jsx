@@ -20,6 +20,14 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
   const hasType = (t) => loads.some((l) => l.load_type === t);
   const totalPeak = loads.reduce((s, l) => s + (+l.peak_mw || 0), 0);
 
+  // The engine sizes against the dataset's real SHAPE scaled to the selected peak,
+  // so show that here (not the raw dataset magnitude) — the same series it uses.
+  const datasetPeak = summary?.peak_load_mw || 0;
+  const scale = datasetPeak > 0 && totalPeak > 0 ? totalPeak / datasetPeak : 1;
+  const sizingLoad = load.map((v) => v * scale);
+  const sizedMean = summary?.mean_load_mw != null ? summary.mean_load_mw * scale : null;
+  const sizedAnnual = summary?.total_load_mwh != null ? summary.total_load_mwh * scale : null;
+
   const toggleType = (t) => {
     if (hasType(t)) {
       if (loads.length <= 1) return;                       // keep at least one load
@@ -31,7 +39,7 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
   const setLoadField = (id, k, v) =>
     patch({ loads: loads.map((l) => (l.id === id ? { ...l, [k]: v } : l)) });
 
-  const max = load.length ? Math.max(...load) * 1.1 : 1;
+  const max = sizingLoad.length ? Math.max(...sizingLoad) * 1.1 : 1;
 
   return (
     <>
@@ -90,23 +98,23 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
       )}
 
       <div className="card">
-        <h3>Demand profile <span className="pill2">live data</span></h3>
-        <div className="hint">The actual load series from {profile?.filename || "the bundled dataset"}. The engine sizes against this real shape, <b>scaled to your selected loads' total peak ({fmt.mw(totalPeak)})</b> — magnitude from your loads, shape from real data. Upload metered data from the top bar to override the shape.</div>
+        <h3>Demand profile <span className="pill2">as sized</span></h3>
+        <div className="hint">This is the exact load the engine sizes against: the real 15-min/hourly <b>shape</b> from {profile?.filename || "the bundled dataset"}, <b>scaled to your selected loads' peak ({fmt.mw(totalPeak)})</b> — magnitude from your loads, shape from real data. Upload metered data (top bar) to change the shape.</div>
         <div className="feaskpis">
-          <div className="kp"><div className="n">{fmt.mw(summary?.peak_load_mw)}</div><div className="l">Dataset peak</div></div>
-          <div className="kp"><div className="n">{fmt.mw(summary?.mean_load_mw)}</div><div className="l">Mean load</div></div>
-          <div className="kp"><div className="n">{summary ? fmt.gwh(summary.total_load_mwh) : "—"}</div><div className="l">Annual energy</div></div>
-          <div className="kp"><div className="n">{fmt.mw(totalPeak)}</div><div className="l">Selected loads peak</div></div>
+          <div className="kp"><div className="n">{fmt.mw(totalPeak)}</div><div className="l">Peak (as sized)</div></div>
+          <div className="kp"><div className="n">{fmt.mw(sizedMean)}</div><div className="l">Mean (as sized)</div></div>
+          <div className="kp"><div className="n">{sizedAnnual != null ? fmt.gwh(sizedAnnual) : "—"}</div><div className="l">Annual energy (as sized)</div></div>
+          <div className="kp"><div className="n">{fmt.mw(summary?.peak_load_mw)}</div><div className="l">Dataset peak (shape source)</div></div>
         </div>
         <div className="chartbox">
-          <div className="clab"><span>Consumer demand — actual dataset (downsampled across the year)</span><span>MW</span></div>
-          {load.length ? (
+          <div className="clab"><span>Consumer demand — real shape scaled to {fmt.mw(totalPeak)} (downsampled across the year)</span><span>MW</span></div>
+          {sizingLoad.length ? (
             <svg className="chart" viewBox="0 0 620 170" preserveAspectRatio="none">
-              <path d={areaPath(load, 620, 170, max)} fill="rgba(63,124,172,.15)" />
-              <path d={linePath(load, 620, 170, max)} fill="none" stroke="#3f7cac" strokeWidth="1.5" />
+              <path d={areaPath(sizingLoad, 620, 170, max)} fill="rgba(63,124,172,.15)" />
+              <path d={linePath(sizingLoad, 620, 170, max)} fill="none" stroke="#3f7cac" strokeWidth="1.5" />
             </svg>
           ) : <div className="subtle" style={{ padding: 20 }}><span className="spinner" /> loading real load series…</div>}
-          <div className="legend"><span><i className="dot" style={{ background: "#3f7cac" }} />Consumer demand</span></div>
+          <div className="legend"><span><i className="dot" style={{ background: "#3f7cac" }} />Consumer demand ({fmt.mw(totalPeak)} peak)</span></div>
         </div>
       </div>
 

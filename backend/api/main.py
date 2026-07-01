@@ -756,59 +756,123 @@ def run(req: RunRequest) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    """A run's result, sent back so it can be written to an Excel workbook. Nothing
-    is re-solved — the sheets are the exact numbers already shown in the UI."""
+    """Everything needed to build a rich Excel workbook. The summary numbers come
+    from the result the UI holds; the per-point dispatch time-series are re-derived
+    by forward-evaluating each sized point (fast — no LP re-solve)."""
     project_name: str = "DIP Project"
     scenario_id: str = ""
     scenario_name: str = ""
     recommended: dict = Field(default_factory=dict)
     vs_grid_default: dict = Field(default_factory=dict)
-    points: list[dict] = Field(default_factory=list)
+    points: list[dict] = Field(default_factory=list)     # each: pv_mw,bess_mw,bess_mwh,ssr_pct,gc_mw,…
     kpis: dict = Field(default_factory=dict)
     assumptions: dict = Field(default_factory=dict)
-    flows: Optional[dict] = None            # {columns, rows} from the run's flows
+    # Inputs to reproduce each point's dispatch (per-slot detail):
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    pv_mw: Optional[float] = None            # fixed solar nameplate across the curve
+    wind_mw: Optional[float] = None
+    site_topology: str = "grid_connected_btm"
+    site_max_grid_mw: float = 200.0
+    eff_charge: float = 0.95
+    eff_discharge: float = 0.95
+    min_soc_pct: float = 10.0
+    max_soc_pct: float = 90.0
+    initial_soc_pct: float = 50.0
+    include_timeseries: bool = True
+    max_point_sheets: int = 12               # cap per-point sheets so files stay sane
 
 
 def _kv_sheet(d: dict) -> pd.DataFrame:
     return pd.DataFrame({"Field": list(d.keys()), "Value": list(d.values())})
 
 
+def _autofit(ws, max_w: int = 42) -> None:
+    """Freeze the header row and set sensible column widths."""
+    ws.freeze_panes = "A2"
+    for col in ws.columns:
+        letter = col[0].column_letter
+        width = max((len(str(c.value)) for c in col if c.value is not None), default=10)
+        ws.column_dimensions[letter].width = min(max_w, max(10, width + 2))
+
+
 @app.post("/export")
 def export_xlsx(req: ExportRequest):
-    """Return an .xlsx workbook of the run: Summary, Recommended design, Frontier
-    points, Comparison, Assumptions, and Dispatch flows. Built from the result the
-    UI already holds, so it matches exactly what's on screen."""
+    """Return a rich .xlsx: Summary, Recommended, Frontier, per-point energy split,
+    Assumptions, and — for each sized point — a full per-slot dispatch sheet showing
+    what served the load every timestep (like the old reports/ builders)."""
+    from core.params import PhysicalParams
+    from core.rule_dispatch import verify_sizing_with_rule
+    from core.report import hourly_flows, energy_split, monthly
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        # Summary
-        summary = {
+        _kv_sheet({
             "Project": req.project_name,
             "Scenario": f"{req.scenario_id} — {req.scenario_name}".strip(" —"),
             "Generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-        _kv_sheet(summary).to_excel(xw, sheet_name="Summary", index=False)
+            "Topology": req.site_topology,
+        }).to_excel(xw, sheet_name="Summary", index=False)
 
-        # Recommended design + value vs grid-default
         rec = {**req.recommended}
         if req.vs_grid_default:
             rec.update({f"vs_grid: {k}": v for k, v in req.vs_grid_default.items()})
         if rec:
             _kv_sheet(rec).to_excel(xw, sheet_name="Recommended", index=False)
-
-        # Frontier / comparison points (every sized configuration)
         if req.points:
             pd.DataFrame(req.points).to_excel(xw, sheet_name="Frontier", index=False)
-
-        # KPIs + assumptions
         if req.kpis:
             _kv_sheet(req.kpis).to_excel(xw, sheet_name="KPIs", index=False)
         if req.assumptions:
             _kv_sheet(req.assumptions).to_excel(xw, sheet_name="Assumptions", index=False)
 
-        # Dispatch flows time-series (the real per-timestep energy balance)
-        if req.flows and req.flows.get("rows"):
-            pd.DataFrame(req.flows["rows"], columns=req.flows["columns"]).to_excel(
-                xw, sheet_name="Dispatch Flows", index=False)
+        # ── Per-point dispatch: forward-eval each sized point → per-slot sheet ──
+        _prof = req.profile_path or str(_DEFAULT_PROFILE)   # default to bundled dataset
+        if req.include_timeseries and Path(_prof).exists():
+            try:
+                df, load_np, pv_np, dt_hours = _load_profile(_prof)
+                # reproduce the run's load scaling + generation combine
+                if req.load_peak_mw and req.load_peak_mw > 0:
+                    cur = float(df["load_mw"].max())
+                    if cur > 1e-9:
+                        df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+                solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
+                wind_mw  = float(req.wind_mw or 0.0)
+                eng_pv = solar_mw
+                if wind_mw > 0 and "wind_pu" in df.columns and float(df["wind_pu"].max()) > 1e-9:
+                    comb = df["pv_pu"].to_numpy() * solar_mw + df["wind_pu"].to_numpy() * wind_mw
+                    peak = float(comb.max())
+                    if peak > 1e-9:
+                        df = df.copy(); df["pv_pu"] = comb / peak; eng_pv = peak
+                params = PhysicalParams(
+                    dt_hours=dt_hours, site_topology=req.site_topology,
+                    site_max_grid_mw=req.site_max_grid_mw,
+                    eff_charge=req.eff_charge, eff_discharge=req.eff_discharge,
+                    min_soc_pct=req.min_soc_pct, max_soc_pct=req.max_soc_pct,
+                    initial_soc_pct=req.initial_soc_pct)
+
+                splits = []
+                pts = [p for p in req.points if (p.get("bess_mwh") or 0) >= 0][: req.max_point_sheets]
+                for i, p in enumerate(pts):
+                    _k, flows = verify_sizing_with_rule(
+                        df, params, pv_mw=eng_pv,
+                        bess_mw=float(p.get("bess_mw") or 0), bess_mwh=float(p.get("bess_mwh") or 0),
+                        target_type="ssr", grid_ceiling_mw=req.site_max_grid_mw)
+                    tag = (f"SSR{round(float(p.get('ssr_pct')))}" if p.get("ssr_pct") is not None
+                           else f"GC{round(float(p.get('gc_mw', 0)))}")
+                    hourly_flows(flows).to_excel(xw, sheet_name=f"P{i+1}_{tag}"[:31], index=False)
+                    splits.append({"Point": f"P{i+1} {tag}",
+                                   "BESS (MW)": p.get("bess_mw"), "BESS (MWh)": p.get("bess_mwh"),
+                                   **energy_split(flows, dt_hours)})
+                if splits:
+                    pd.DataFrame(splits).to_excel(xw, sheet_name="Per-point energy", index=False)
+                    # monthly breakdown of the recommended (last-ish / representative)
+                    monthly(flows, dt_hours).to_excel(xw, sheet_name="Monthly (last point)", index=False)
+            except Exception as exc:
+                _kv_sheet({"time-series error": str(exc)}).to_excel(xw, sheet_name="Dispatch note", index=False)
+
+        for ws in xw.book.worksheets:
+            _autofit(ws)
 
     buf.seek(0)
     stamp = datetime.now().strftime("%Y%m%d_%H%M")

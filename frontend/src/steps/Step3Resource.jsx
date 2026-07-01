@@ -36,7 +36,7 @@ export function Step3Resource({ cfg, patch, summary, step, go }) {
         <h3 style={{ color: "var(--ok)" }}>Feasibility Gate</h3>
         <div style={{ fontSize: 13, fontWeight: 600, color: "var(--ok)", padding: "8px 0" }}>
           {summary ? (() => {
-            const maxGen = (cfg.parcel?.maxSolarMw || 0) + (cfg.tech?.wind ? (cfg.parcel?.maxWindMw || 0) : 0);
+            const maxGen = (cfg.tech?.solar ? (cfg.parcels?.solar?.maxMw || 0) : 0) + (cfg.tech?.wind ? (cfg.parcels?.wind?.maxMw || 0) : 0);
             const ok = maxGen >= summary.peak_load_mw;
             return <>
               {ok ? "✔" : "⚠"} Available generation from the parcel <b>{fmt.mw(maxGen)}</b>

@@ -37,8 +37,9 @@ const DEFAULT_CFG = {
   loads: [{ id: "load-dc", load_type: "data_centre", name: "Data Centre", peak_mw: 24, baseline_mw: 14 }],
   topology: "btm",   // derived from the flow designer; btm | off_grid | standalone | backup
   tech: { solar: true, wind: false, bess: true },
-  // Land parcel → available generation (set by the drawer in Step 2).
-  parcel: { areaHa: 184, maxSolarMw: 166, maxWindMw: 48 },
+  // Separate land parcels per technology — solar and wind compete for land, so
+  // each has its own buildable area → its own max nameplate (set in Step 2).
+  parcels: { solar: { areaHa: 184, maxMw: 166 }, wind: { areaHa: 184, maxMw: 48 } },
   econ: {
     grid_cost_mwh: 150,
     grid_connection_cost_mw: 250000,

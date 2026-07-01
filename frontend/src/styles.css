@@ -60,7 +60,16 @@ button{font-family:inherit;}
 .stepper .s.active .lab b{color:var(--teal-dark);}
 .stepper .check{margin-left:auto;color:var(--ok);font-size:13px;}
 
-.content{flex:1;padding:30px 40px;max-width:1000px;}
+.content{flex:1;min-width:0;padding:28px clamp(20px,4vw,56px);}   /* fluid — fills the screen width */
+
+/* Responsive: stack the stepper above the content on narrow screens */
+@media(max-width:860px){
+  .shell{flex-direction:column;}
+  .stepper{width:100%;display:flex;gap:6px;overflow-x:auto;border-right:none;border-bottom:1px solid var(--line);padding:12px;}
+  .stepper .s{flex:0 0 auto;}
+  .stepper .s .lab small{display:none;}
+  .content{padding:20px;}
+}
 .pagehead h1{margin:0;font-size:23px;color:var(--slate);}
 .pagehead p{margin:6px 0 0;color:var(--grey);font-size:14px;}
 
