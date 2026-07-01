@@ -1,6 +1,6 @@
 import pandas as pd
 from archive.legacy_pipeline.legacy_params import ProjectParams
-from optimizer.schema import KpiKeys, RESULT_REQUIRED_COLUMNS, ResultCols, require_columns
+from core.schema import KpiKeys, RESULT_REQUIRED_COLUMNS, ResultCols, require_columns
 
 def compute_kpis(res_df: pd.DataFrame, dt: float, params: ProjectParams) -> dict:
     """

@@ -1,62 +1,91 @@
-# DIP Italy Microgrid Optimizer
+# DIP Italy — Microgrid Sizing & Dispatch Optimizer
 
-A behind-the-meter sizing and dispatch optimization engine specifically designed for data centres with on-site PV and BESS. The tool uses Pyomo and the HiGHS solver to perform linear programming (LP) based optimization.
+A behind-the-meter (BTM) sizing and dispatch optimisation platform for data centres
+with on-site PV and BESS. A Pyomo + HiGHS linear-programming engine drives a two-phase
+method, exposed through a CLI, a FastAPI service, and a React decision-support UI.
 
-It complies with the two-phase approach specified in the DIP specification:
-- **Phase 1**: Sizes the BESS purely on physical constraints (no economics) to generate objective feasibility curves.
-- **Phase 2**: Overlays CAPEX, OPEX, degradation, and alternative revenue streams to identify the techno-economic optimal point on those curves.
+- **Phase 1** — sizes the BESS on physical constraints only (no economics) to produce
+  objective feasibility curves (SSR, peak-shaving, PV+BESS surface).
+- **Phase 2** — overlays CAPEX/OPEX/degradation and alternative revenue to find the
+  techno-economic optimum (knee / LCOE / NPV) on those curves.
 
-## Requirements
+## Repository structure
 
-The tool requires Python 3.10+ and the packages listed in `requirements.txt`:
+```
+.
+├── backend/                  # everything Python — the engine and its service
+│   ├── core/                 # the LP engine (sizing, dispatch rule, economics, resolver)
+│   ├── api/                  # FastAPI service (main.py)
+│   ├── data/                 # input datasets (8760 profiles, BESS_Input)
+│   ├── main.py               # Phase 1 / Phase 2 command-line entry point
+│   └── requirements.txt      # engine + API dependencies
+├── frontend/                 # React + Vite decision-support UI (6-step wizard)
+│   └── src/
+│       ├── lib/              # api client + chart helpers
+│       └── steps/            # one file per wizard step
+├── docs/                     # specification, design review, brief
+└── archive/                  # superseded / legacy code (not part of the live app)
+```
+
+## Quick start
+
+### 1. Backend (engine + API)
 
 ```bash
+cd backend
+python -m venv ../.venv && source ../.venv/bin/activate   # first time only
 pip install -r requirements.txt
+uvicorn api.main:app --reload --port 8000                 # serves the API on :8000
 ```
 
-*Note: The tool relies on the `highspy` package to provide the open-source HiGHS linear programming solver.*
+> Requires Python 3.10+. The `highspy` package provides the open-source HiGHS LP solver.
 
-## Usage
-
-### Phase 1: Physical Sizing Curves
-
-Generates the physical feasibility curves. This phase sweeps across different targets (SSR and Grid Limits) and calculates the minimum BESS capacity required.
+### 2. Frontend (React UI)
 
 ```bash
-python main.py --phase1 --profiles "8760_PV&Load Profiles.xlsx"
+cd frontend
+npm install        # first time only
+npm run dev        # serves the UI on :5173, proxying /api → :8000
 ```
 
-**Key Arguments:**
-- `--profiles`: Path to the Excel file containing 8760 hourly load and PV data.
-- `--resample-15min`: Automatically interpolates the hourly data into 15-minute resolution before solving (recommended for accurate peak shaving).
-- `--scenarios A B C D`: Choose which scenarios to run.
-  - A: Main SSR curve
-  - B: Main Peak Shaving curve
-  - C: PV+BESS co-sizing surface
-  - D: Sub-scenario Peak Shaving (no PV)
+Open <http://localhost:5173>. The UI walks six steps — project definition, site,
+assumptions, closed-loop sizing, scenario comparison, decision pack — calling the
+real engine for every solved number.
 
-**Outputs:**
-- `Phase1_Sizing_Curves.xlsx` (Contains all points and configurations)
-- `plot_ssr_curve.html` (Interactive plot)
-- `plot_peakshaving_curve.html` (Interactive plot)
-- `plot_surface.html` (Interactive 3D surface plot)
+## Command-line usage (no server)
 
----
+All CLI commands run from `backend/`:
 
-### Phase 2: Techno-Economic Overlay
+```bash
+cd backend
+```
 
-Reads the Phase 1 curves and identifies the "knee-of-curve" optimal point by overlaying CAPEX and OPEX assumptions. It also performs grid services and seasonal shifting analyses.
+### Phase 1 — physical sizing curves
+
+```bash
+python main.py --phase1 --profiles "data/8760_PV&Load Profiles.xlsx"
+```
+
+- `--profiles` — Excel with 8760 hourly load + PV data (defaults to the bundled dataset).
+- `--scenarios A B C D` — A: SSR curve · B: peak-shaving · C: PV+BESS surface · D: sub peak-shaving.
+- `--resample-15min` — solve at native 15-min resolution (errors on hourly data; peaks are never fabricated).
+
+Outputs: `Phase1_Sizing_Curves.xlsx` + interactive `plot_*.html`.
+
+### Phase 2 — techno-economic overlay
 
 ```bash
 python main.py --phase2 --curves "Phase1_Sizing_Curves.xlsx" --verify-dispatch
 ```
 
-**Key Arguments:**
-- `--curves`: Path to the Phase 1 output file.
-- `--verify-dispatch`: Takes the chosen optimal design and runs it through a 48-hour rolling horizon dispatch simulation to prove it operates correctly with real-world forecasting constraints.
-- `--site-area`: Optional limit on physical land area (in m²) to constrain large solar/BESS combinations.
-- `--cost-pv-mw`, `--cost-bess-mwh`, `--grid-price`, etc: Customise all unit economics via the CLI. Run `python main.py -h` for the full list.
+- `--curves` — the Phase 1 output to cost.
+- `--verify-dispatch` — re-runs the chosen design through rolling-horizon dispatch.
+- `--cost-pv-mw`, `--cost-bess-mwh`, `--grid-price`, `--site-area`, … — economic overrides (`python main.py -h` for the full list).
 
-**Outputs:**
-- `Phase2_TechnoEconomic.xlsx` (Full financial breakdown, seasonal shifting, site constraints)
-- `Phase2_Dispatch_Verification.xlsx` (If `--verify-dispatch` is passed)
+Outputs: `Phase2_TechnoEconomic.xlsx` (+ `Phase2_Dispatch_Verification.xlsx`).
+
+## Scenario reports
+
+Standalone per-scenario report builders live in `archive/reports/<name>/build.py`.
+They predate the web UI (which now drives scenarios directly) and are kept for
+reference; generated workbooks/plots are git-ignored.

@@ -1,6 +1,0 @@
-# Web layer only — the engine's own deps are in the repo-root requirements.txt
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.0
-streamlit>=1.30
-requests>=2.31

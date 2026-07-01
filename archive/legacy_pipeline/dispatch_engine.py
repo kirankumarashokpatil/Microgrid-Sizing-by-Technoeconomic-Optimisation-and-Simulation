@@ -10,9 +10,9 @@ the solver to naturally prioritize cheap renewables over expensive grid imports.
 """
 import pyomo.environ as pyo
 import pandas as pd
-from optimizer.params import SizingResult, PhysicalParams
-from optimizer.schema import RESULT_REQUIRED_COLUMNS, SIM_REQUIRED_COLUMNS, ResultCols, SimCols, require_columns
-from optimizer.solver import create_highs_solver
+from core.params import SizingResult, PhysicalParams
+from core.schema import RESULT_REQUIRED_COLUMNS, SIM_REQUIRED_COLUMNS, ResultCols, SimCols, require_columns
+from core.solver import create_highs_solver
 
 def run_dispatch_simulation(
     profiles_df: pd.DataFrame,

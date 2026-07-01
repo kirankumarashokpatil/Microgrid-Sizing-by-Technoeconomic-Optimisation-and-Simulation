@@ -9,7 +9,7 @@ adapted to pull from a SQL database or a REST API in the future without changing
 import pandas as pd
 import warnings
 from archive.legacy_pipeline.legacy_params import ProjectParams
-from optimizer.schema import SIM_REQUIRED_COLUMNS, SimCols, require_columns
+from core.schema import SIM_REQUIRED_COLUMNS, SimCols, require_columns
 
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 

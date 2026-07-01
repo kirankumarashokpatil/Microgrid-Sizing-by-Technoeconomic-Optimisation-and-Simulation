@@ -1,0 +1,14 @@
+# Engine
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+openpyxl>=3.1.0
+pyomo>=6.6.0
+highspy>=1.5.0
+plotly>=5.14.0
+
+# API (FastAPI service)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.0
+python-multipart>=0.0.9

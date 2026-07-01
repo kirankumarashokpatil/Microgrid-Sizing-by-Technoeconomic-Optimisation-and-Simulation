@@ -14,6 +14,7 @@ Thumbs.db
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
 env.bak/
@@ -37,10 +38,17 @@ archive/Phase1_Sizing_Curves.xlsx
 archive/Phase2_TechnoEconomic.xlsx
 archive/Phase2_Dispatch_Verification.xlsx
 
-# Per-scenario report outputs (regenerate via reports/<scenario>/build.py)
-reports/**/*.xlsx
-reports/**/*.html
-reports/**/*.csv
+# Per-scenario report outputs (regenerate via <name>/build.py); reports now archived
+backend/reports/**/*.xlsx
+backend/reports/**/*.html
+backend/reports/**/*.csv
+archive/reports/**/*.xlsx
+archive/reports/**/*.html
+archive/reports/**/*.csv
+archive/reports/scaling_study/inputs/
+
+# Design reference mockups (scratch)
+DIP-Mock-UI*.html
 
 # Stale root-level generated outputs (regenerable)
 CoOpt_SSR_GC_Report.xlsx

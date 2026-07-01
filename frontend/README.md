@@ -1,6 +1,6 @@
 # React front end (the new "dining room")
 
-This is a React app that talks to the **same** FastAPI backend (`webapp/api.py`)
+This is a React app that talks to the **same** FastAPI backend (`backend/api/main.py`)
 the Streamlit screen used. The optimiser (`optimizer/`) and the API are
 unchanged — we only swapped the dining room, exactly as planned.
 
@@ -25,8 +25,8 @@ You need the backend running, then the React dev server.
 
 ```bash
 # Terminal 1 — backend (the kitchen window)
-cd "/Users/kirankumarpatil/Desktop/Data Centre"
-uvicorn webapp.api:app --reload --port 8000
+cd "/Users/kirankumarpatil/Desktop/Data Centre/backend"
+uvicorn api.main:app --reload --port 8000
 
 # Terminal 2 — React front end
 cd "/Users/kirankumarpatil/Desktop/Data Centre/frontend"

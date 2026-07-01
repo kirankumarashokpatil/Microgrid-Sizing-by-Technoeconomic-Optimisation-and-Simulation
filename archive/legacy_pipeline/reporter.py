@@ -7,7 +7,7 @@ we ever want to build a web dashboard, generate PDF reports, or connect to Table
 we only have to edit this file, rather than digging through the optimization mathematics.
 """
 import pandas as pd
-from optimizer.schema import ResultCols
+from core.schema import ResultCols
 
 def save_report(excel_path, res_df, fin_df):
     print(f"\n💾 Saving results back to {excel_path}...")
