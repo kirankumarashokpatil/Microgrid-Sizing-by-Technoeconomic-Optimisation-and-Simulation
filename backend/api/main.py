@@ -643,6 +643,58 @@ def resolve(req: ResolveRequest) -> dict:
     return out
 
 
+class SsrRangeRequest(BaseModel):
+    """Inputs to probe the FEASIBLE SSR band before the user picks a target."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    pv_mw: Optional[float] = None
+    wind_mw: Optional[float] = None
+    site_topology: str = "grid_connected_btm"
+    site_max_bess_mw: float = 500.0
+    site_max_bess_mwh: float = 4000.0
+    site_max_grid_mw: float = 200.0
+
+
+@app.post("/ssr-range")
+def ssr_range(req: SsrRangeRequest) -> dict:
+    """The feasible SSR band for these inputs: SSR_min (no battery, PV-direct) and
+    SSR_max (the site's maximum battery). Two fast forward-evals — no LP sweep — so
+    the UI can show the achievable range before a target is chosen."""
+    from core.params import PhysicalParams
+    from core.rule_dispatch import verify_sizing_with_rule
+    from core.schema import KpiKeys
+
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    if not Path(path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
+    df, load_np, pv_np, dt_hours = _load_profile(path)
+    if req.load_peak_mw and req.load_peak_mw > 0:
+        cur = float(df["load_mw"].max())
+        if cur > 1e-9:
+            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+    solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
+    wind_mw  = float(req.wind_mw or 0.0)
+    eng_pv = solar_mw
+    if wind_mw > 0 and "wind_pu" in df.columns and float(df["wind_pu"].max()) > 1e-9:
+        comb = df["pv_pu"].to_numpy() * solar_mw + df["wind_pu"].to_numpy() * wind_mw
+        peak = float(comb.max())
+        if peak > 1e-9:
+            df = df.copy(); df["pv_pu"] = comb / peak; eng_pv = peak
+    params = PhysicalParams(dt_hours=dt_hours, site_topology=req.site_topology,
+                            site_max_grid_mw=req.site_max_grid_mw)
+
+    def ssr_at(bess_mw, bess_mwh):
+        k, _ = verify_sizing_with_rule(df, params, pv_mw=eng_pv, bess_mw=bess_mw,
+                                       bess_mwh=bess_mwh, target_type="ssr",
+                                       grid_ceiling_mw=req.site_max_grid_mw)
+        return float(k.get(KpiKeys.SSR, 0.0) or 0.0)
+
+    ssr_min = ssr_at(0.0, 0.0)                                   # no storage → PV-direct floor
+    ssr_max = ssr_at(req.site_max_bess_mw, req.site_max_bess_mwh)  # max storage → ceiling
+    return _clean_dict({"ssr_min": round(ssr_min, 1), "ssr_max": round(ssr_max, 1),
+                        "has_generation": eng_pv > 0})
+
+
 @app.post("/run")
 def run(req: RunRequest) -> dict:
     """Run one scenario and return its result as JSON. This is the one endpoint

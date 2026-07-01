@@ -30,6 +30,14 @@ export const resolveScenario = (inputs) =>
     body: JSON.stringify(inputs),
   }).then(handle);
 
+// The feasible SSR band [min, max] for these inputs (fast, before picking a target).
+export const ssrRange = (inputs) =>
+  fetch(`${BASE}/ssr-range`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(inputs),
+  }).then(handle);
+
 export const getProfileSummary = (profilePath) => {
   const q = profilePath ? `?profile_path=${encodeURIComponent(profilePath)}` : "";
   return fetch(`${BASE}/profile-summary${q}`).then(handle);

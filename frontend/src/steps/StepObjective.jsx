@@ -1,7 +1,9 @@
 // Objective step — asks the target that FITS the system's derived topology. This
 // is why it comes AFTER the energy system: an SSR covenant only means something
 // with a grid; off-grid uses firmness, standalone curtailment, backup a grid cap.
+import { useEffect, useState } from "react";
 import { Nav } from "./shared.jsx";
+import { ssrRange } from "../lib/api.js";
 import { fmt } from "../lib/svg.js";
 
 const TOPO_LABEL = {
@@ -26,9 +28,18 @@ function Slider({ label, hint, value, min, max, onChange, color, suffix = "%" })
 //   SSR              target → S11,  sweep → S21
 //   Grid connection  target → S12,  sweep → S22,  "lowest achievable" → S51
 //   SSR + Grid       both targets  → S71 (co-optimise)
-function BtmObjective({ cfg, patch }) {
+function BtmObjective({ cfg, patch, range }) {
   const obj = cfg.btmObjective || "ssr";
   const TABS = [["ssr", "Self-sufficiency"], ["gc", "Grid connection"], ["both", "SSR + Grid"]];
+  // Feasible SSR band → slider bounds + a clamp so an impossible target isn't set.
+  const lo = range?.ssr_min != null ? Math.max(0, Math.floor(range.ssr_min)) : 50;
+  const hi = range?.ssr_max != null ? Math.min(100, Math.ceil(range.ssr_max)) : 99;
+  const overshoot = cfg.ssrTarget != null && range?.ssr_max != null && cfg.ssrTarget > range.ssr_max;
+  const bandNote = range === undefined
+    ? <span className="subtle"><span className="spinner" /> checking feasible SSR range…</span>
+    : range?.ssr_max != null
+      ? <>Feasible SSR for this system: <b>{fmt.pct1(range.ssr_min)} – {fmt.pct1(range.ssr_max)}</b> (no battery → max battery). Pick a target inside this band.</>
+      : null;
   return (
     <div className="card" style={{ borderColor: "var(--red)", background: "var(--red-light)" }}>
       <h3 style={{ color: "var(--red)" }}>What should the engine size for?</h3>
@@ -43,18 +54,24 @@ function BtmObjective({ cfg, patch }) {
       {(obj === "ssr" || obj === "both") && (
         <div style={{ marginBottom: obj === "both" ? 16 : 0 }}>
           <label className="fld">Self-sufficiency (SSR)</label>
+          {bandNote && <div style={{ fontSize: 12.5, color: "var(--teal-dark)", margin: "0 0 8px" }}>{bandNote}</div>}
           {obj === "ssr" && (
             <label className="subtle" style={{ display: "block", margin: "2px 0 10px", cursor: "pointer", fontSize: 13 }}>
               <input type="checkbox" checked={cfg.ssrTarget == null}
-                     onChange={(e) => patch({ ssrTarget: e.target.checked ? null : 95 })} />{" "}
+                     onChange={(e) => patch({ ssrTarget: e.target.checked ? null : Math.min(95, hi) })} />{" "}
               Sweep the full SSR curve (no fixed target)
             </label>
           )}
           {cfg.ssrTarget != null ? (
-            <div className="slider-wrap">
-              <input type="range" min={50} max={99} value={cfg.ssrTarget} onChange={(e) => patch({ ssrTarget: +e.target.value })} />
-              <span className="ssrval" style={{ color: "var(--red)" }}>{cfg.ssrTarget}%</span>
-            </div>
+            <>
+              <div className="slider-wrap">
+                <input type="range" min={lo} max={hi} value={Math.min(hi, Math.max(lo, cfg.ssrTarget))}
+                       onChange={(e) => patch({ ssrTarget: +e.target.value })} />
+                <span className="ssrval" style={{ color: overshoot ? "var(--red)" : "var(--red)" }}>{cfg.ssrTarget}%</span>
+              </div>
+              {overshoot && <div className="banner warn" style={{ marginTop: 8 }}>
+                {cfg.ssrTarget}% exceeds the feasible max ({fmt.pct1(range.ssr_max)}). It will be infeasible — lower it, or enlarge the parcel in Step 2.</div>}
+            </>
           ) : <div className="subtle">Sweeps SSR from feasible min → max; recommends the knee design.</div>}
         </div>
       )}
@@ -87,11 +104,26 @@ function BtmObjective({ cfg, patch }) {
   );
 }
 
-export function StepObjective({ cfg, patch, step, go }) {
+export function StepObjective({ cfg, patch, profile, step, go }) {
   const derived = cfg.topoSignals?.derived_topology || cfg.topology || "btm";
 
+  // Probe the feasible SSR band up front (only meaningful for BTM/grid-connected).
+  const [range, setRange] = useState(null);
+  const sig = cfg.topoSignals || {};
+  const pvMw = sig.pv_mw ?? cfg.parcels?.solar?.maxMw ?? 150;
+  const windMw = sig.wind_mw ?? (cfg.tech?.wind ? cfg.parcels?.wind?.maxMw : 0) ?? 0;
+  const loadPeak = (cfg.loads || []).reduce((s, l) => s + (+l.peak_mw || 0), 0);
+  useEffect(() => {
+    if (derived !== "btm") { setRange(null); return; }
+    setRange(undefined);   // loading
+    ssrRange({ profile_path: profile?.profile_path, pv_mw: pvMw, wind_mw: windMw,
+               load_peak_mw: loadPeak, site_topology: "grid_connected_btm" })
+      .then(setRange).catch(() => setRange(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [derived, pvMw, windMw, loadPeak, profile]);
+
   const objective = {
-    btm: <BtmObjective cfg={cfg} patch={patch} />,
+    btm: <BtmObjective cfg={cfg} patch={patch} range={range} />,
     off_grid: (
       <Slider label="Firmness target" color="var(--ok)"
         hint="With no grid to fall back on, the share of demand PV+BESS must firmly meet on their own."
