@@ -320,15 +320,19 @@ function Frontier({ pts, rec, target }) {
   const tx = hasTarget ? X(target) : 0;
   return (
     <svg className="chart" viewBox="0 0 620 240">
+      {/* faint horizontal gridlines */}
+      {[0, 0.25, 0.5, 0.75, 1].map((t, i) => { const y = 10 + t * (H - pad - 10); return <line key={i} x1={pad} y1={y} x2={W - 8} y2={y} stroke="#eef2f3" />; })}
+      {/* shade the feasible region (meets the covenant) */}
+      {hasTarget && <rect x={tx} y={10} width={Math.max(0, W - 8 - tx)} height={H - pad - 10} fill="rgba(47,143,91,.06)" />}
       <line x1={pad} y1={H - pad} x2={W - 8} y2={H - pad} stroke="#d6dde0" />
       <line x1={pad} y1={10} x2={pad} y2={H - pad} stroke="#d6dde0" />
       <text x={W / 2} y={H - 6} fontSize="11" fill="#6b7780" textAnchor="middle">SSR % →</text>
       <text x={12} y={H / 2} fontSize="11" fill="#6b7780" textAnchor="middle" transform={`rotate(-90 12 ${H / 2})`}>GCmin (MW)</text>
       {hasTarget && <>
         <line x1={tx} y1={10} x2={tx} y2={H - pad} stroke="#c2603a" strokeWidth="1.3" strokeDasharray="5 4" />
-        <text x={tx - 5} y={20} fontSize="10" fill="#c2603a" textAnchor="end">Target {target}%</text>
+        <text x={tx - 5} y={20} fontSize="10" fill="#c2603a" textAnchor="end">Target {target}% →</text>
       </>}
-      {pts.map((p, i) => <circle key={i} cx={X(+p.ssr_pct)} cy={Y(+p.gc_mw)} r="4" fill="#cdd6da" />)}
+      {pts.map((p, i) => <circle key={i} cx={X(+p.ssr_pct)} cy={Y(+p.gc_mw)} r="4" fill={hasTarget && +p.ssr_pct >= target ? "#8fc7aa" : "#cdd6da"} />)}
       {rec && (
         <>
           <circle cx={X(+rec.ssr_pct)} cy={Y(+rec.gc_mw)} r="7" fill="#2f8f5b" stroke="#fff" strokeWidth="2" />

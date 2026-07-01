@@ -5,6 +5,7 @@ import { useState } from "react";
 import { NeedRun } from "./shared.jsx";
 import { column, exportXlsx } from "../lib/api.js";
 import { linePath, areaPath, downsample, fmt } from "../lib/svg.js";
+import { energyTotals, monthlyDispatch, socSeries, PALETTE } from "../lib/charts.js";
 
 const TOPO_MAP = { btm: "grid_connected_btm", backup: "bess_load_only", off_grid: "off_grid", standalone: "standalone_gen" };
 
@@ -47,7 +48,14 @@ export function Step6Decision({ cfg, profile, result, flows, step, go }) {
         <Tile cls="t-curt" k="Curtailment" v={curt != null ? fmt.pct(curt) : "—"} s="generation spilled" />
       </div>
 
-      {flows && <DispatchChart flows={flows} />}
+      {flows && <>
+        <DispatchChart flows={flows} />
+        <div className="grid2">
+          <EnergyReconciliation flows={flows} />
+          <SocChart flows={flows} />
+        </div>
+        <MonthlyDispatch flows={flows} />
+      </>}
 
       <div className="row" style={{ marginTop: 20 }}>
         <div className="card" style={{ marginTop: 0, flex: 1 }}>
@@ -147,6 +155,94 @@ function DispatchChart({ flows }) {
         <span><i className="dot" style={{ background: "#2f8f5b" }} />BESS discharge</span>
         <span><i className="dot" style={{ background: "#c2603a" }} />Grid import</span>
         <span><i className="dot" style={{ background: "#3f7cac" }} />Demand</span>
+      </div>
+    </div>
+  );
+}
+
+// Horizontal stacked bar helper.
+function HBar({ segs, total }) {
+  const W = 620, H = 26, sum = total || segs.reduce((s, x) => s + x.v, 0) || 1;
+  let x = 0;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: "block", marginTop: 6 }}>
+      {segs.map((s, i) => {
+        const w = (s.v / sum) * W; const el = <rect key={i} x={x} y={4} width={Math.max(0, w - 1)} height={H - 8} rx="2" fill={s.color} />;
+        x += w; return el;
+      })}
+    </svg>
+  );
+}
+
+// Annual energy reconciliation — where demand is met, and where generation goes.
+function EnergyReconciliation({ flows }) {
+  const t = energyTotals(flows, 1);
+  const d = t.demand, g = t.gen;
+  const Legend = ({ items }) => (
+    <div className="legend" style={{ marginTop: 6 }}>
+      {items.map(([l, c, v]) => <span key={l}><i className="dot" style={{ background: c }} />{l} {fmt.gwh(v)}</span>)}
+    </div>
+  );
+  return (
+    <div className="card" style={{ marginTop: 0 }}>
+      <h3>Annual energy reconciliation</h3>
+      <div className="hint">Every MWh accounted for — no static averages.</div>
+      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--grey)" }}>Demand met — {fmt.gwh(d.total)}</div>
+      <HBar total={d.total} segs={[{ v: d.direct, color: PALETTE.pv }, { v: d.bess, color: PALETTE.bess }, { v: d.grid, color: PALETTE.grid }, { v: d.unmet, color: PALETTE.unmet }]} />
+      <Legend items={[["Direct", PALETTE.pv, d.direct], ["BESS", PALETTE.bess, d.bess], ["Grid", PALETTE.grid, d.grid], ...(d.unmet > 0 ? [["Unmet", PALETTE.unmet, d.unmet]] : [])]} />
+      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--grey)", marginTop: 12 }}>Generation used — {fmt.gwh(g.avail)}</div>
+      <HBar total={g.avail} segs={[{ v: g.used, color: PALETTE.pv }, { v: g.curtail, color: PALETTE.curtail }]} />
+      <Legend items={[["Used on site", PALETTE.pv, g.used], ["Curtailed", PALETTE.curtail, g.curtail]]} />
+    </div>
+  );
+}
+
+// BESS state-of-charge across the year.
+function SocChart({ flows }) {
+  const soc = socSeries(flows);
+  const max = soc.length ? Math.max(...soc, 1) * 1.1 : 1;
+  return (
+    <div className="card" style={{ marginTop: 0 }}>
+      <h3>BESS state of charge — full year</h3>
+      <div className="hint">How the battery cycles across the year (MWh stored).</div>
+      <svg className="chart" viewBox="0 0 620 150" preserveAspectRatio="none">
+        <path d={areaPath(soc, 620, 150, max)} fill="rgba(47,143,91,.18)" />
+        <path d={linePath(soc, 620, 150, max)} fill="none" stroke={PALETTE.soc} strokeWidth="1.5" />
+      </svg>
+      <div className="legend"><span><i className="dot" style={{ background: PALETTE.soc }} />SOC (MWh)</span></div>
+    </div>
+  );
+}
+
+// Monthly stacked dispatch — direct / BESS / grid contribution to load.
+function MonthlyDispatch({ flows }) {
+  const m = monthlyDispatch(flows, 1);
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const W = 620, H = 190, pad = 24, bw = (W - pad) / 12 - 8;
+  const max = Math.max(...m.map((x) => x.direct + x.bess + x.grid), 1) * 1.05;
+  const Y = (v) => (H - pad) - (v / max) * (H - pad - 10);
+  return (
+    <div className="card">
+      <h3>Monthly dispatch mix</h3>
+      <div className="hint">How demand is met each month — seasonal shift from PV toward grid/BESS.</div>
+      <svg className="chart" viewBox="0 0 620 190">
+        <line x1={pad} y1={H - pad} x2={W} y2={H - pad} stroke="#d6dde0" />
+        {m.map((x, i) => {
+          const bx = pad + i * ((W - pad) / 12) + 4;
+          const segs = [[x.direct, PALETTE.pv], [x.bess, PALETTE.bess], [x.grid, PALETTE.grid]];
+          let yTop = H - pad;
+          return (
+            <g key={i}>
+              {segs.map(([v, c], k) => { const h = (H - pad) - Y(v); yTop -= h; return <rect key={k} x={bx} y={yTop} width={bw} height={h} fill={c} />; })}
+              <text x={bx + bw / 2} y={H - pad + 12} fontSize="9" fill="#6b7780" textAnchor="middle">{names[i]}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="legend">
+        <span><i className="dot" style={{ background: PALETTE.pv }} />Direct</span>
+        <span><i className="dot" style={{ background: PALETTE.bess }} />BESS</span>
+        <span><i className="dot" style={{ background: PALETTE.grid }} />Grid</span>
       </div>
     </div>
   );

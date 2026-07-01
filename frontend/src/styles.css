@@ -83,6 +83,11 @@ input:focus,select:focus{outline:none;border-color:var(--teal);box-shadow:0 0 0 
 .row{display:flex;gap:16px;flex-wrap:wrap;}
 .row > div{flex:1;min-width:140px;}
 
+/* Responsive 2-column grid for side-by-side cards — collapses on narrow screens */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:20px;}
+.grid2 > .card{margin-top:0;}
+@media(max-width:900px){.grid2{grid-template-columns:1fr;}}
+
 /* selectable cards */
 .choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:6px;}
 .choice{border:1.5px solid var(--line2);border-radius:10px;padding:16px;cursor:pointer;transition:.15s;background:#fff;}

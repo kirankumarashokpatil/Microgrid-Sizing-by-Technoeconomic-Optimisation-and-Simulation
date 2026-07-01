@@ -44,19 +44,20 @@ export function Step2Site({ cfg, patch, step, go }) {
       </div>
 
       {drawsParcel && (
-        <div className="card">
-          <h3>Land parcels → available generation</h3>
-          <div className="hint">Draw a <b>separate</b> buildable parcel for each generation technology — solar and wind
-            compete for land, so each has its own area and its own maximum nameplate the engine sizes against.</div>
-          {cfg.tech.solar && (
-            <div style={{ marginBottom: cfg.tech.wind ? 18 : 0 }}>
-              <LandParcel kind="solar" onChange={(p) => patch({ parcels: { ...cfg.parcels, solar: p } })} />
-            </div>
-          )}
-          {cfg.tech.wind && (
-            <LandParcel kind="wind" onChange={(p) => patch({ parcels: { ...cfg.parcels, wind: p } })} />
-          )}
-        </div>
+        <>
+          <div style={{ margin: "20px 0 -6px" }}>
+            <h3 style={{ margin: 0 }}>Land parcels → available generation</h3>
+            <div className="hint" style={{ margin: "4px 0 0" }}>Draw a <b>separate</b> parcel per technology on the map — solar and wind compete for land, so each has its own area and its own max nameplate.</div>
+          </div>
+          <div className={cfg.tech.solar && cfg.tech.wind ? "grid2" : ""}>
+            {cfg.tech.solar && (
+              <div className="card"><LandParcel kind="solar" onChange={(p) => patch({ parcels: { ...cfg.parcels, solar: p } })} /></div>
+            )}
+            {cfg.tech.wind && (
+              <div className="card"><LandParcel kind="wind" onChange={(p) => patch({ parcels: { ...cfg.parcels, wind: p } })} /></div>
+            )}
+          </div>
+        </>
       )}
 
       <FlowDesigner cfg={cfg} onTopoChange={handleTopoChange} />
