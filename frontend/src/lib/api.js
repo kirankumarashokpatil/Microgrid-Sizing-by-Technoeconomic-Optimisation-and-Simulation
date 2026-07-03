@@ -66,6 +66,14 @@ export const parcelCapacity = (inputs) =>
     body: JSON.stringify(inputs),
   }).then(handle);
 
+// The reciprocal: a target generation (MW) → the land (ha) it needs + yields.
+export const capacityFromMw = (inputs) =>
+  fetch(`${BASE}/capacity-from-mw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(inputs),
+  }).then(handle);
+
 export const runScenario = (payload) =>
   fetch(`${BASE}/run`, {
     method: "POST",

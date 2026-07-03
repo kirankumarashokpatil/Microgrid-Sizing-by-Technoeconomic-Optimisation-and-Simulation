@@ -21,6 +21,9 @@ _KT           = 0.55     # clearness index (atmospheric transmittance)
 _GSC          = 1367.0   # solar constant (W/m²)
 _WIND_MW_PER_HA = 48.0 / 184.0   # ~0.26 MW/ha (calibrated to the reference site)
 _WIND_CF      = 0.34     # wind capacity factor
+# Solar nameplate density (MWp/ha) implied by GCR × module efficiency — the inverse
+# of parcel_capacity's solar sizing. Location-independent (nameplate, not yield).
+_SOLAR_MW_PER_HA = _GCR * _PANEL_EFF * 10_000.0 / 1000.0   # ≈ 0.9 MWp/ha
 
 
 def _annual_irradiation_kwh_m2(lat_deg: float) -> float:
@@ -76,3 +79,20 @@ def parcel_capacity(area_ha: float, lat_deg: float = 51.96, lon_deg: float = 1.3
         "wind_gwh":     round(wind_mwh / 1000.0, 1),
         "irradiation_kwh_m2": round(irr, 0),
     }
+
+
+def area_for_capacity(mw: float, tech: str = "solar",
+                      lat_deg: float = 51.96, lon_deg: float = 1.35) -> dict:
+    """Inverse of parcel_capacity: the land a target nameplate needs.
+
+    Given a desired solar/wind capacity (MW), return the required area (ha) at
+    the tech's build density, plus the same yields parcel_capacity reports for
+    that area — so the UI's "size by generation" is consistent with "size by
+    area". Density is location-independent (nameplate); yields use the latitude."""
+    mw = max(0.0, float(mw))
+    density = _WIND_MW_PER_HA if tech == "wind" else _SOLAR_MW_PER_HA
+    area_ha = mw / density if density > 1e-9 else 0.0
+    out = parcel_capacity(area_ha, lat_deg, lon_deg)
+    out["tech"] = tech
+    out["target_mw"] = round(mw, 1)
+    return out

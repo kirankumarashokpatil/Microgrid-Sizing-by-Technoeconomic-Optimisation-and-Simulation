@@ -57,7 +57,7 @@ from core.economic_overlay import (                          # noqa: E402
     evaluate_costs, find_optimal_point,
 )
 from core.resolver import resolve_scenario                   # noqa: E402
-from core.site import parcel_capacity                        # noqa: E402
+from core.site import parcel_capacity, area_for_capacity     # noqa: E402
 from core.boundary import parse_boundary                      # noqa: E402
 from core.schema import CurveCols, KpiKeys                   # noqa: E402
 from core.scenarios import (                                 # noqa: E402
@@ -594,6 +594,21 @@ def parcel_capacity_endpoint(req: ParcelRequest) -> dict:
     """Available generation a land parcel can host — max solar/wind MW + yields.
     The engineering calculation lives in core/site.py, so the UI never computes it."""
     return _clean_dict(parcel_capacity(req.area_ha, req.lat, req.lon))
+
+
+class CapacityFromMwRequest(BaseModel):
+    """The reciprocal of a parcel: a target nameplate → the land it needs."""
+    mw: float = 50.0
+    tech: str = "solar"          # solar | wind
+    lat: float = 51.96
+    lon: float = 1.35
+
+
+@app.post("/capacity-from-mw")
+def capacity_from_mw_endpoint(req: CapacityFromMwRequest) -> dict:
+    """Land a target generation (MW) needs, at the tech's build density — the
+    inverse of /parcel-capacity, powering the UI's 'size by generation' toggle."""
+    return _clean_dict(area_for_capacity(req.mw, req.tech, req.lat, req.lon))
 
 
 @app.post("/parse-boundary")

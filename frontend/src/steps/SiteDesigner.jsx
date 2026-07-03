@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { parcelCapacity, parseBoundary } from "../lib/api.js";
+import { parcelCapacity, parseBoundary, capacityFromMw } from "../lib/api.js";
 import { LOAD_TYPES } from "../lib/loads.js";
 import { fmt } from "../lib/svg.js";
 
@@ -55,6 +55,17 @@ function polygonAreaHa(latlngs) {
   return Math.abs(a / 2) / 10000; // m² -> ha
 }
 
+// Scale a ring about its centroid so its area becomes targetHa (area ∝ scale²).
+// Lets the inspector "size by area / MW" reshape the polygon to match a number.
+function rescaleRingToArea(latlngs, targetHa) {
+  const cur = polygonAreaHa(latlngs);
+  if (cur <= 1e-9 || targetHa <= 0) return latlngs;
+  const f = Math.sqrt(targetHa / cur);
+  const cLat = latlngs.reduce((s, p) => s + p.lat, 0) / latlngs.length;
+  const cLng = latlngs.reduce((s, p) => s + p.lng, 0) / latlngs.length;
+  return latlngs.map((p) => ({ lat: cLat + (p.lat - cLat) * f, lng: cLng + (p.lng - cLng) * f }));
+}
+
 // Generate default ring around lat/lon
 function defaultRing(lat, lon, scale = 1) {
   const dLat = 0.0055 * scale;
@@ -70,6 +81,54 @@ function defaultRing(lat, lon, scale = 1) {
 
 let _pid = 100;
 const nextPid = () => `pcl-${++_pid}`;
+
+// Size a generation parcel by AREA or by GENERATION (MW) — Asif's radio + input.
+// Applying reshapes the polygon to match; the reciprocal is computed by the backend.
+function GenSizer({ parcel, onArea, onMw }) {
+  const [mode, setMode] = useState("area");   // 'area' | 'mw'
+  const [val, setVal] = useState("");
+  useEffect(() => {
+    setVal(String(mode === "area" ? Math.round(parcel.areaHa) : Math.round(parcel.maxMw)));
+  }, [parcel.id, parcel.areaHa, parcel.maxMw, mode]);
+
+  const apply = () => {
+    const n = parseFloat(val);
+    if (!(n > 0)) return;
+    if (mode === "area") onArea(n); else onMw(n);
+  };
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <label className="fld" style={{ marginBottom: 4 }}>Size by</label>
+      <div style={{ display: "flex", background: "#e2e8f0", padding: 3, borderRadius: 8, gap: 2, marginBottom: 8 }}>
+        {[["area", "Area (ha)"], ["mw", "Generation (MW)"]].map(([k, label]) => (
+          <button key={k} type="button" onClick={() => setMode(k)}
+            style={{ flex: 1, padding: "5px 8px", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600,
+              cursor: "pointer", background: mode === k ? "#fff" : "transparent",
+              color: mode === k ? "#0f172a" : "#64748b", boxShadow: mode === k ? "0 1px 3px rgba(0,0,0,.1)" : "none" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input type="number" value={val} min="0" onChange={(e) => setVal(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && apply()}
+          style={{ flex: 1, padding: "7px 10px", border: "1px solid #cbd5e1", borderRadius: 8, fontWeight: 600, fontSize: 13 }} />
+        <span style={{ alignSelf: "center", fontSize: 12.5, color: "#64748b", width: 26 }}>{mode === "area" ? "ha" : "MW"}</span>
+        <button type="button" onClick={apply}
+          style={{ padding: "7px 12px", background: "#15616d", color: "#fff", border: "none", borderRadius: 8,
+            fontWeight: 600, fontSize: 12.5, cursor: "pointer" }}>
+          Set
+        </button>
+      </div>
+      <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 6 }}>
+        {mode === "area"
+          ? "Reshapes the parcel to this area; capacity follows."
+          : "Reshapes the parcel to fit this nameplate at build density."}
+      </div>
+    </div>
+  );
+}
 
 export default function SiteDesigner({ cfg, patch }) {
   const mapContainerRef = useRef(null);
@@ -197,6 +256,32 @@ export default function SiteDesigner({ cfg, patch }) {
       updateParcel(id, { latlngs: ll, tech: tch, ...loadDefault, areaHa: polygonAreaHa(ll) });
     }
   }, [parcels, computeBackendStats, updateParcel]);
+
+  // Reciprocal sizing (Phase 2): set a generation parcel by AREA or by MW. Both
+  // reshape the polygon about its centroid so the map and the numbers stay in sync.
+  const sizeByArea = useCallback(async (id, targetHa) => {
+    const p = parcels.find((x) => x.id === id);
+    if (!p) return;
+    await handleShapeOrTechChange(id, rescaleRingToArea(p.latlngs, targetHa), p.tech);
+  }, [parcels, handleShapeOrTechChange]);
+
+  const sizeByMw = useCallback(async (id, targetMw) => {
+    const p = parcels.find((x) => x.id === id);
+    if (!p) return;
+    const lat = p.latlngs[0]?.lat ?? 51.96, lon = p.latlngs[0]?.lng ?? 1.35;
+    try {
+      const c = await capacityFromMw({ mw: targetMw, tech: p.tech, lat, lon });
+      updateParcel(id, {
+        latlngs: rescaleRingToArea(p.latlngs, c.area_ha), areaHa: c.area_ha,
+        maxMw: Math.round(targetMw),
+        yieldGwh: p.tech === "wind" ? c.wind_gwh : c.solar_gwh,
+        cfPct: p.tech === "wind" ? 38 : c.solar_cf_pct,
+      });
+    } catch {
+      const ha = targetMw / (p.tech === "wind" ? 0.26 : 0.9);   // density fallback
+      updateParcel(id, { latlngs: rescaleRingToArea(p.latlngs, ha), areaHa: ha, maxMw: Math.round(targetMw) });
+    }
+  }, [parcels, updateParcel]);
 
   // Initialize Leaflet Map
   useEffect(() => {
@@ -906,6 +991,15 @@ export default function SiteDesigner({ cfg, patch }) {
                       ))}
                     </select>
                   </>
+                )}
+
+                {/* Reciprocal sizing — generation parcels only (Phase 2) */}
+                {GENERATION.has(selectedParcel.tech) && (
+                  <GenSizer
+                    parcel={selectedParcel}
+                    onArea={(ha) => sizeByArea(selectedParcel.id, ha)}
+                    onMw={(mw) => sizeByMw(selectedParcel.id, mw)}
+                  />
                 )}
 
                 {/* KPI Metrics card inside inspector */}
