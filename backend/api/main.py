@@ -58,6 +58,7 @@ from core.economic_overlay import (                          # noqa: E402
 )
 from core.resolver import resolve_scenario                   # noqa: E402
 from core.site import parcel_capacity                        # noqa: E402
+from core.boundary import parse_boundary                      # noqa: E402
 from core.schema import CurveCols, KpiKeys                   # noqa: E402
 from core.scenarios import (                                 # noqa: E402
     REGISTRY, Status, ScenarioContext, coverage, describe,
@@ -158,6 +159,13 @@ class RunRequest(BaseModel):
     # Network topology — authoritative when supplied, overriding the scenario's
     # default. None ⇒ fall back to the scenario's registry topology (spec.topology).
     site_topology: Optional[str] = None    # grid_connected_btm | bess_load_only | off_grid | standalone_gen
+
+    # ── Dispatch policy (Model R) — frontend-overridable ──────────────────
+    # Ordered causal merit order. Empty ⇒ engine uses the mode default. Entries
+    # must be from rule_dispatch.DISPATCH_ACTIONS.
+    dispatch_priority: list[str] = Field(default_factory=list)
+    # Tri-state grid-charging: null ⇒ infer from objective; true/false ⇒ force it.
+    allow_grid_charge: Optional[bool] = None
 
     # ── Economics (Phase-2 overlay). When `with_economics` is true and the run
     #    produces a sizing curve/point, the response gains an `economics` block:
@@ -350,20 +358,26 @@ def _simple_irr(capex: float, annual_benefit: float, years: int) -> Optional[flo
 def _attach_economics(result, req: "RunRequest", profiles_df: pd.DataFrame,
                       dt_hours: float, solar_mw: Optional[float] = None,
                       wind_mw: float = 0.0) -> Optional[dict]:
-    """Overlay Phase-2 economics on a run result. Works for curve/surface/frontier
-    tables (cost every point, pick a recommended one) and for point designs (cost
-    the single design). Returns a JSON-safe dict, or None when nothing is costable.
-
-    Everything here is computed by optimizer.economic_overlay from the real sizing
-    output — no synthetic numbers. Savings/IRR are stated against a 100%-grid
-    baseline so the 'value vs grid-default' figures are explicit and auditable."""
+    """Overlay Phase-2 economics on a run result (Phase 1 output). Thin wrapper that
+    picks the curve/point frame, then hands off to _economics_block."""
     eco = _eco_from_request(req)
-
-    # 1. Get a CurveCols frame to cost: the table for curves, else a 1-row point.
     curve = result.table
     is_point = curve is None or curve.empty
     if is_point:
         curve = _point_to_curve_df(result)
+    if curve is None or curve.empty or CurveCols.BESS_MWH not in curve.columns:
+        return None
+    return _economics_block(curve, eco, profiles_df, dt_hours, req.economic_objective,
+                            solar_mw=solar_mw, wind_mw=wind_mw, is_point=is_point)
+
+
+def _economics_block(curve, eco, profiles_df: pd.DataFrame, dt_hours: float,
+                     objective: str, solar_mw: Optional[float] = None,
+                     wind_mw: float = 0.0, is_point: bool = False) -> Optional[dict]:
+    """The Phase-2 costing itself: cost every point of a sizing curve, pick the
+    recommended one, and compute value vs a 100%-grid baseline. No LP re-solve —
+    this is a fast overlay on an already-sized curve. All numbers come from
+    core.economic_overlay; savings/IRR are stated against the grid baseline."""
     if curve is None or curve.empty or CurveCols.BESS_MWH not in curve.columns:
         return None
 
@@ -381,7 +395,7 @@ def _attach_economics(result, req: "RunRequest", profiles_df: pd.DataFrame,
     if costed is None or costed.empty:
         return None
 
-    rec = find_optimal_point(costed, objective=req.economic_objective)
+    rec = find_optimal_point(costed, objective=objective)
     if rec is None or rec.empty:
         return None
 
@@ -424,7 +438,7 @@ def _attach_economics(result, req: "RunRequest", profiles_df: pd.DataFrame,
     } for _, r in costed.iterrows()]
 
     return _clean_dict({
-        "objective":          req.economic_objective,
+        "objective":          objective,
         "is_point":           is_point,
         "recommended": _clean_dict({
             "ssr_pct":   _ssr(rec),
@@ -582,6 +596,26 @@ def parcel_capacity_endpoint(req: ParcelRequest) -> dict:
     return _clean_dict(parcel_capacity(req.area_ha, req.lat, req.lon))
 
 
+@app.post("/parse-boundary")
+async def parse_boundary_endpoint(file: UploadFile = File(...)) -> dict:
+    """Accept a GeoJSON / KMZ / KML boundary export and return the land parcel
+    rings it contains — each as {latlngs, area_ha, centroid, name}.
+
+    This lets a developer start from real GIS data instead of hand-drawing the
+    boundary on the map. The geometry work lives in core/boundary.py so the API
+    stays a thin translator, exactly like /parcel-capacity."""
+    name = file.filename or "boundary"
+    if not name.lower().endswith((".geojson", ".json", ".kml", ".kmz")):
+        raise HTTPException(status_code=400, detail="Please upload a .geojson, .json, .kml or .kmz file.")
+    try:
+        rings = parse_boundary(name, await file.read())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read boundary file: {exc}")
+    if not rings:
+        raise HTTPException(status_code=400, detail="No polygon boundary found in the file.")
+    return {"filename": name, "rings": rings}
+
+
 @app.post("/upload-profile")
 async def upload_profile(file: UploadFile = File(...)) -> dict:
     """Accept an uploaded .xlsx, validate it loads in one of the two known
@@ -695,6 +729,66 @@ def ssr_range(req: SsrRangeRequest) -> dict:
                         "has_generation": eng_pv > 0})
 
 
+class EconomicsRequest(BaseModel):
+    """Phase-2 overlay inputs: the Phase-1 sized points + the economic assumptions.
+    Re-costs the curve WITHOUT re-solving the LP, so CAPEX tweaks are instant."""
+    points: list[dict] = Field(default_factory=list)   # from a prior run's economics.points
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    solar_mw: Optional[float] = None
+    wind_mw: float = 0.0
+    economic_objective: str = "knee"
+    cost_pv_mw: float = 700_000.0
+    cost_wind_mw: float = 1_300_000.0
+    cost_bess_mw: float = 150_000.0
+    cost_bess_mwh: float = 300_000.0
+    grid_connection_cost_mw: float = 250_000.0
+    grid_cost_mwh: float = 150.0
+    fixed_opex_per_mwh_year: float = 8_000.0
+    cycle_life: int = 5000
+    replacement_cost_mwh: float = 300_000.0
+    nominal_discount_rate_pct: float = 8.0
+    inflation_rate_pct: float = 2.5
+    project_lifespan_years: float = 20.0
+    off_take_tariff_mwh: float = 0.0
+
+
+@app.post("/economics")
+def economics(req: EconomicsRequest) -> dict:
+    """Phase 2 — overlay economics on an already-sized curve. Fast (no LP re-solve):
+    the SIZE step runs the LP once, then this re-prices the curve every time the
+    CAPEX assumptions change and re-picks the recommended commercial design."""
+    if not req.points:
+        return {"economics": None}
+    rows = [{
+        CurveCols.SCENARIO:         "econ",
+        CurveCols.PV_MW:            float(p.get("pv_mw") or 0),
+        CurveCols.WIND_MW:          float(req.wind_mw or 0),
+        CurveCols.BESS_MW:          float(p.get("bess_mw") or 0),
+        CurveCols.BESS_MWH:         float(p.get("bess_mwh") or 0),
+        CurveCols.PEAK_GC_MW:       float(p.get("gc_mw") or 0),
+        CurveCols.ACHIEVED_SSR_PCT: float(p.get("ssr_pct") or 0),
+        CurveCols.OP_SSR_PCT:       float(p.get("ssr_pct") or 0),
+        CurveCols.ACHIEVED_SCR_PCT: float(p.get("scr_pct") or 0),
+        CurveCols.FEASIBLE:         True,
+    } for p in req.points]
+    curve = pd.DataFrame(rows)
+    eco = _eco_from_request(req)   # duck-typed: same cost field names as RunRequest
+
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    if not Path(path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
+    df, load_np, pv_np, dt_hours = _load_profile(path)
+    if req.load_peak_mw and req.load_peak_mw > 0:
+        cur = float(df["load_mw"].max())
+        if cur > 1e-9:
+            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+
+    block = _economics_block(curve, eco, df, dt_hours, req.economic_objective,
+                             solar_mw=req.solar_mw, wind_mw=req.wind_mw, is_point=len(rows) == 1)
+    return {"economics": block}
+
+
 @app.post("/run")
 def run(req: RunRequest) -> dict:
     """Run one scenario and return its result as JSON. This is the one endpoint
@@ -704,6 +798,14 @@ def run(req: RunRequest) -> dict:
         spec = get_scenario(req.scenario_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Unknown scenario '{req.scenario_id}'")
+
+    # Validate the dispatch-priority override up front (client error, not a 500).
+    if req.dispatch_priority:
+        from core.rule_dispatch import resolve_priority
+        try:
+            resolve_priority("self_sufficiency", req.dispatch_priority)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     if spec.status != Status.READY:
         raise HTTPException(
             status_code=409,
@@ -746,6 +848,8 @@ def run(req: RunRequest) -> dict:
         export_limit_mw=req.export_limit_mw,
         eol_capacity_retention_pct=req.eol_capacity_retention_pct,
         site_topology=topology,
+        dispatch_priority=tuple(req.dispatch_priority or ()),
+        allow_grid_charge=req.allow_grid_charge,
     )
 
     # 3b. Wind (opt-in). The engine consumes ONE generation array; when a wind
@@ -804,6 +908,88 @@ def run(req: RunRequest) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Land-first evaluation core (Phase 1) — one land/demand input → scenario compare
+# ──────────────────────────────────────────────────────────────────────────────
+class DesignRequest(BaseModel):
+    """Land-first design input. From the available land + the data-centre demand +
+    the (pre-allotted / built) generation, produce the canonical scenario comparison
+    so a developer sees what a battery actually buys — without picking a scenario id.
+
+    This is the Phase-1 core: it ORCHESTRATES existing ready scenarios rather than
+    changing the engine. Later phases promote generation to a decision variable
+    under the land budget (see GIGA_PARK_CHANGES.md)."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None       # data-centre demand peak (MW) — the anchor
+    pv_mw: float = 0.0                          # allotted / built solar nameplate (MW)
+    wind_mw: float = 0.0                        # allotted / built wind nameplate (MW)
+    target_ssr_pct: float = 90.0               # self-sufficiency target for the BESS design
+    site_topology: Optional[str] = "grid_connected_btm"
+    with_economics: bool = False
+    available_land_ha: Optional[float] = None  # informational now; constrains later phases
+
+
+_DESIGN_KPI = {
+    "ssr_pct": "SSR (%)", "scr_pct": "SCR (%)",
+    "curtailment_pct": "OSR / Curtailment (%)",
+    "grid_p95_mw": "GCmin P95 (MW)", "grid_import_mwh": "Total Grid Import (MWh)",
+}
+
+
+def _design_summary(label: str, config: str, out: dict, wind_mw: float) -> dict:
+    """Normalise one /run result into a comparison row."""
+    design = out.get("design") or {}
+    kpis = out.get("kpis") or {}
+    econ = out.get("economics") if isinstance(out.get("economics"), dict) else None
+    rec = (econ or {}).get("recommended") or {}
+    row = {
+        "label": label, "config": config,
+        "feasible": out.get("feasible"),
+        "grid_peak_mw": kpis.get("GCmin Peak (MW)", design.get("gc_mw")),
+        "pv_mw": design.get("pv_mw"), "wind_mw": wind_mw,
+        "bess_mw": design.get("bess_mw"), "bess_mwh": design.get("bess_mwh"),
+        "duration_h": design.get("duration_h"),
+        "capex_m": rec.get("capex_m") if isinstance(rec, dict) else None,
+    }
+    for out_key, kpi_key in _DESIGN_KPI.items():
+        row[out_key] = kpis.get(kpi_key)
+    return row
+
+
+@app.post("/design")
+def design(req: DesignRequest) -> dict:
+    """Phase-1 evaluation core: one land/demand input → a scenario comparison.
+
+    Orchestrates three READY scenarios on the same inputs:
+      • Grid-only baseline    — S00, pv=0, bess=0
+      • Generation, no BESS   — S00, generation fixed, bess=0
+      • Generation + BESS     — S11, size BESS for the target SSR
+    Returns a comparison array so the front end shows what the battery buys."""
+    def _run(scenario_id: str, pv: float, wind: float) -> dict:
+        return run(RunRequest(
+            scenario_id=scenario_id, profile_path=req.profile_path,
+            load_peak_mw=req.load_peak_mw, pv_mw=pv, wind_mw=wind,
+            target_ssr_pct=req.target_ssr_pct, site_topology=req.site_topology,
+            with_economics=req.with_economics,
+        ))
+
+    scenarios = [
+        _design_summary("Grid-only", "no gen · no BESS",
+                        _run("S00_FIXED_DESIGN_EVAL", 0.0, 0.0), 0.0),
+        _design_summary("Generation, no BESS", "B = 0 forced",
+                        _run("S00_FIXED_DESIGN_EVAL", req.pv_mw, req.wind_mw), req.wind_mw),
+        _design_summary("Generation + BESS", f"BESS sized for SSR {req.target_ssr_pct:g}%",
+                        _run("S11_BTM_SSR_TARGET_BESS", req.pv_mw, req.wind_mw), req.wind_mw),
+    ]
+    return {
+        "inputs": {
+            "load_peak_mw": req.load_peak_mw, "pv_mw": req.pv_mw, "wind_mw": req.wind_mw,
+            "target_ssr_pct": req.target_ssr_pct, "available_land_ha": req.available_land_ha,
+        },
+        "scenarios": scenarios,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Excel export — build a downloadable .xlsx from a run result (no re-solve)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -833,6 +1019,9 @@ class ExportRequest(BaseModel):
     initial_soc_pct: float = 50.0
     include_timeseries: bool = True
     max_point_sheets: int = 12               # cap per-point sheets so files stay sane
+    # Dispatch policy (Model R) so the re-derived per-slot flows match the run.
+    dispatch_priority: list[str] = Field(default_factory=list)
+    allow_grid_charge: Optional[bool] = None
 
 
 def _kv_sheet(d: dict) -> pd.DataFrame:
@@ -901,7 +1090,9 @@ def export_xlsx(req: ExportRequest):
                     site_max_grid_mw=req.site_max_grid_mw,
                     eff_charge=req.eff_charge, eff_discharge=req.eff_discharge,
                     min_soc_pct=req.min_soc_pct, max_soc_pct=req.max_soc_pct,
-                    initial_soc_pct=req.initial_soc_pct)
+                    initial_soc_pct=req.initial_soc_pct,
+                    dispatch_priority=tuple(req.dispatch_priority or ()),
+                    allow_grid_charge=req.allow_grid_charge)
 
                 splits = []
                 pts = [p for p in req.points if (p.get("bess_mwh") or 0) >= 0][: req.max_point_sheets]

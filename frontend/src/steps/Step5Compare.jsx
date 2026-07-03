@@ -1,7 +1,7 @@
 // Step 5 — Scenario comparison. Derives objective rows (knee / min-GCmin /
 // min-CAPEX / max-SSR) from the real swept points and flags any design that
 // fails the SSR covenant. No synthetic numbers — all rows come from the sweep.
-import { Nav, NeedRun } from "./shared.jsx";
+import { Nav, NeedRun, DispatchPolicyBadge } from "./shared.jsx";
 import { fmt } from "../lib/svg.js";
 
 export function Step5Compare({ cfg, result, step, go }) {
@@ -71,6 +71,38 @@ export function Step5Compare({ cfg, result, step, go }) {
           </tbody>
         </table>
       </div>
+
+      <div className="card">
+        <h3>All swept configurations</h3>
+        <div className="hint">Every sized point from the SSR sweep ({pts.length} configurations), ordered by SSR. The knee is highlighted; rows below the {target}% covenant are flagged.</div>
+        <table>
+          <thead><tr>
+            <th>#</th><th>PV</th><th>BESS</th><th>GCmin</th><th>SSR</th><th>CAPEX</th><th>LCOE</th><th>Covenant</th>
+          </tr></thead>
+          <tbody>
+            {[...pts].sort((a, b) => +a.ssr_pct - +b.ssr_pct).map((p, i) => {
+              const pass = +p.ssr_pct >= target - 0.05;
+              const isRec = eco.recommended
+                && +p.ssr_pct === +eco.recommended.ssr_pct && +p.gc_mw === +eco.recommended.gc_mw;
+              return (
+                <tr key={i} className={isRec ? "best" : (pass ? "" : "rejected")}>
+                  <td>{i + 1}{isRec ? " ★" : ""}</td>
+                  <td>{fmt.mw(p.pv_mw)}</td>
+                  <td>{fmt.mw(p.bess_mw)} / {fmt.mwh(p.bess_mwh)}</td>
+                  <td>{fmt.mw(p.gc_mw)}</td>
+                  <td style={{ color: pass ? "var(--ok)" : "var(--red)", fontWeight: 700 }}>{fmt.pct1(p.ssr_pct)}</td>
+                  <td>{fmt.eurM(p.capex_m)}</td>
+                  <td>{fmt.num(p.lcoe, 0)} €/MWh</td>
+                  <td>{isRec ? <span className="badge teal">Knee</span>
+                    : pass ? <span className="badge">Passes</span>
+                    : <span className="badge red">Below {target}%</span>}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <DispatchPolicyBadge cfg={cfg} />
       <Nav go={go} step={step} nextLabel="Continue → Decision Pack" />
     </>
   );
@@ -96,7 +128,9 @@ function TradeoffScatter({ pts, rec, target }) {
       <text x={12} y={H / 2} fontSize="11" fill="#6b7780" textAnchor="middle" transform={`rotate(-90 12 ${H / 2})`}>CAPEX (€M) →</text>
       {pts.map((p, i) => (
         <circle key={i} cx={X(+p.gc_mw)} cy={Y(+p.capex_m)} r="5"
-                fill={+p.ssr_pct >= target - 0.05 ? "#2f8f5b" : "#c2603a"} opacity="0.75" />
+                fill={+p.ssr_pct >= target - 0.05 ? "#2f8f5b" : "#c2603a"} opacity="0.75">
+          <title>{`SSR ${fmt.pct1(p.ssr_pct)} · GCmin ${fmt.mw(p.gc_mw)} · CAPEX ${fmt.eurM(p.capex_m)}\nPV ${fmt.mw(p.pv_mw)} · BESS ${fmt.mw(p.bess_mw)} / ${fmt.mwh(p.bess_mwh)}`}</title>
+        </circle>
       ))}
       {rec && <circle cx={X(+rec.gc_mw)} cy={Y(+rec.capex_m)} r="8" fill="none" stroke="#15616d" strokeWidth="2.5" />}
     </svg>
@@ -125,7 +159,9 @@ function CapexVsSsr({ pts, target }) {
         <text x={tx - 4} y={20} fontSize="10" fill="#c2603a" textAnchor="end">covenant {target}%</text>
       </>}
       <path d={d} fill="none" stroke="#e0922f" strokeWidth="2" />
-      {sorted.map((p, i) => <circle key={i} cx={X(+p.ssr_pct)} cy={Y(+p.capex_m)} r="3.5" fill="#e0922f" />)}
+      {sorted.map((p, i) => <circle key={i} cx={X(+p.ssr_pct)} cy={Y(+p.capex_m)} r="3.5" fill="#e0922f">
+        <title>{`SSR ${fmt.pct1(p.ssr_pct)} · CAPEX ${fmt.eurM(p.capex_m)}\nPV ${fmt.mw(p.pv_mw)} · BESS ${fmt.mw(p.bess_mw)} / ${fmt.mwh(p.bess_mwh)}`}</title>
+      </circle>)}
     </svg>
   );
 }

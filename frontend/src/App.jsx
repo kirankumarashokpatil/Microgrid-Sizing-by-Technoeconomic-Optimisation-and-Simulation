@@ -11,18 +11,19 @@ import { Step4Sizing } from "./steps/Step4Sizing.jsx";
 import { Step5Compare } from "./steps/Step5Compare.jsx";
 import { Step6Decision } from "./steps/Step6Decision.jsx";
 
-// Smart order: define the consumer, design the system (topology emerges), THEN
-// ask the objective that fits that topology, then economics, then optimise.
+// Land-first order: design the system on the land (land + tech + topology emerges)
+// → define consumer → objective → SIZE (Phase 1: physical sizing, the LP) →
+// ECONOMICS (Phase 2: CAPEX overlay, no re-solve) → compare → decision.
 const STEPS = [
+  { t: "Energy System", s: "Land, tech, flow topology" },
   { t: "Consumer & Load", s: "Who you power + demand" },
-  { t: "Energy System", s: "Tech, land, flow topology" },
   { t: "Objective", s: "Target that fits the system" },
-  { t: "Assumptions", s: "Economics" },
-  { t: "Optimise", s: "Engine sizing" },
+  { t: "Size", s: "Phase 1 · physical sizing" },
+  { t: "Economics", s: "Phase 2 · CAPEX overlay" },
   { t: "Comparison", s: "Multi-objective" },
   { t: "Decision Pack", s: "IC & lender ready" },
 ];
-export const SIZING_STEP = 4;   // index of the Optimise step (used by result guards)
+export const SIZING_STEP = 3;   // index of the Size step (used by result guards)
 
 const DEFAULT_CFG = {
   projectName: "Felixstowe Port — DC Colocation",
@@ -37,6 +38,10 @@ const DEFAULT_CFG = {
   loads: [{ id: "load-dc", load_type: "data_centre", name: "Data Centre", peak_mw: 24, baseline_mw: 14 }],
   topology: "btm",   // derived from the flow designer; btm | off_grid | standalone | backup
   tech: { solar: true, wind: false, bess: true },
+  // Dispatch policy (Model R). priority: [] ⇒ engine's default merit order for the
+  // objective; a non-empty ordered list overrides it. allowGridCharge: null ⇒ infer
+  // from objective, true/false ⇒ force it.
+  dispatch: { priority: [], allowGridCharge: null },
   // Separate land parcels per technology — solar and wind compete for land, so
   // each has its own buildable area → its own max nameplate (set in Step 2).
   parcels: { solar: { areaHa: 184, maxMw: 166 }, wind: { areaHa: 184, maxMw: 48 } },
@@ -138,11 +143,11 @@ export default function App() {
         </aside>
 
         <div className="content">
-          {step === 0 && <Step1Project {...ctx} />}
-          {step === 1 && <Step2Site {...ctx} />}
+          {step === 0 && <Step2Site {...ctx} />}     {/* Energy System — land first */}
+          {step === 1 && <Step1Project {...ctx} />}  {/* Consumer & Load */}
           {step === 2 && <StepObjective {...ctx} />}
-          {step === 3 && <Step3Resource {...ctx} />}
-          {step === 4 && <Step4Sizing {...ctx} />}
+          {step === 3 && <Step4Sizing {...ctx} />}     {/* Size — Phase 1 */}
+          {step === 4 && <Step3Resource {...ctx} />}   {/* Economics — Phase 2 */}
           {step === 5 && <Step5Compare {...ctx} />}
           {step === 6 && <Step6Decision {...ctx} />}
         </div>

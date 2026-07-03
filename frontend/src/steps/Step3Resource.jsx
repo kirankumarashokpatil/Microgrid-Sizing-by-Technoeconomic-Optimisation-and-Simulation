@@ -18,7 +18,7 @@ export function Step3Resource({ cfg, patch, summary, step, go }) {
   const setE = (k, v) => patch({ econ: { ...e, [k]: +v } });
   return (
     <>
-      <div className="pagehead"><h1>Step 4 — Assumptions</h1>
+      <div className="pagehead"><h1>Step 5 — Economics</h1>
         <p>Financial assumptions that feed the Phase-2 economics overlay. Every IC-pack number traces back to these.</p></div>
 
       <div className="card">
@@ -49,7 +49,7 @@ export function Step3Resource({ cfg, patch, summary, step, go }) {
         </div>
       </div>
 
-      <Nav go={go} step={step} nextLabel="Continue → Optimise" />
+      <Nav go={go} step={step} nextLabel="Continue → Comparison" />
     </>
   );
 }

@@ -171,7 +171,7 @@ export function StepObjective({ cfg, patch, profile, step, go }) {
 
       {objective[derived] || objective.btm}
 
-      <Nav go={go} step={step} nextLabel="Continue → Assumptions" />
+      <Nav go={go} step={step} nextLabel="Continue → Size" />
     </>
   );
 }

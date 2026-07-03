@@ -38,6 +38,14 @@ export const ssrRange = (inputs) =>
     body: JSON.stringify(inputs),
   }).then(handle);
 
+// Phase 2 — re-cost an already-sized curve with new CAPEX assumptions (no LP re-solve).
+export const overlayEconomics = (inputs) =>
+  fetch(`${BASE}/economics`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(inputs),
+  }).then(handle);
+
 export const getProfileSummary = (profilePath) => {
   const q = profilePath ? `?profile_path=${encodeURIComponent(profilePath)}` : "";
   return fetch(`${BASE}/profile-summary${q}`).then(handle);
@@ -60,6 +68,15 @@ export const parcelCapacity = (inputs) =>
 
 export const runScenario = (payload) =>
   fetch(`${BASE}/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(handle);
+
+// Land-first evaluation core (Phase 1): one land/demand input → a scenario
+// comparison { inputs, scenarios: [grid-only, generation no-BESS, generation+BESS] }.
+export const runDesign = (payload) =>
+  fetch(`${BASE}/design`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -90,6 +107,14 @@ export const uploadProfile = (file) => {
   const fd = new FormData();
   fd.append("file", file);
   return fetch(`${BASE}/upload-profile`, { method: "POST", body: fd }).then(handle);
+};
+
+// Parse an uploaded land-boundary export (GeoJSON / KMZ / KML) into parcel
+// rings — {rings: [{latlngs, area_ha, centroid, name}]} — computed backend-side.
+export const parseBoundary = (file) => {
+  const fd = new FormData();
+  fd.append("file", file);
+  return fetch(`${BASE}/parse-boundary`, { method: "POST", body: fd }).then(handle);
 };
 
 // Turn the backend's {columns, rows} table into an array of row-objects, the

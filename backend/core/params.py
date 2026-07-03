@@ -54,6 +54,15 @@ class PhysicalParams:
     # "grid_connected_btm" (default), "off_grid", "standalone_gen"
     site_topology: str = "grid_connected_btm"
 
+    # ── Dispatch policy (Model R) — frontend-overridable ──────────────────
+    # Custom causal merit order. Empty ⇒ use the mode's built-in default order
+    # (see rule_dispatch.DEFAULT_PRIORITY). Entries must be dispatch actions
+    # from rule_dispatch.DISPATCH_ACTIONS, applied in the given sequence.
+    dispatch_priority: tuple = ()
+    # Tri-state grid-charging override. None ⇒ infer from mode (peak-shaving on,
+    # self-sufficiency off). True/False ⇒ force the frontend's choice.
+    allow_grid_charge: object = None    # Optional[bool]
+
     # ── Sweep Configuration ───────────────────────────────────────────────
     # SSR curve: step size in percentage points
     ssr_sweep_step_pct: float  = 5.0    # e.g. 5 → sweep 5%, 10%, 15%…

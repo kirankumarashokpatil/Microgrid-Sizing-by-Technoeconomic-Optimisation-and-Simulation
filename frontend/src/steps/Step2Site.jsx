@@ -1,8 +1,8 @@
-// Step 2 — Energy System: the technologies, the land parcel that sets available
+// Step 1 — Energy System: the technologies, the land parcel that sets available
 // generation, and the Closed-Loop Energy Flow Designer. Topology is DERIVED from
 // the flow graph (its single source of truth) and flows to the Objective step.
 import { Nav } from "./shared.jsx";
-import LandParcel from "./LandParcel.jsx";
+import SiteDesigner from "./SiteDesigner.jsx";
 import FlowDesigner from "./FlowDesigner.jsx";
 
 const TECH = [
@@ -28,8 +28,8 @@ export function Step2Site({ cfg, patch, step, go }) {
 
   return (
     <>
-      <div className="pagehead"><h1>Step 2 — Energy System</h1>
-        <p>Choose the technologies, draw the land, and design the energy flow. The system topology is derived from your flow design and drives the objective next.</p></div>
+      <div className="pagehead"><h1>Step 1 — Energy System</h1>
+        <p>Start from the land: import or draw the parcel, choose the technologies, and design the energy flow. The system topology is derived from your flow design and drives the objective. You define the consumers next.</p></div>
 
       <div className="card">
         <h3>Technologies to consider</h3>
@@ -44,25 +44,12 @@ export function Step2Site({ cfg, patch, step, go }) {
       </div>
 
       {drawsParcel && (
-        <>
-          <div style={{ margin: "20px 0 -6px" }}>
-            <h3 style={{ margin: 0 }}>Land parcels → available generation</h3>
-            <div className="hint" style={{ margin: "4px 0 0" }}>Draw a <b>separate</b> parcel per technology on the map — solar and wind compete for land, so each has its own area and its own max nameplate.</div>
-          </div>
-          <div className={cfg.tech.solar && cfg.tech.wind ? "grid2" : ""}>
-            {cfg.tech.solar && (
-              <div className="card"><LandParcel kind="solar" onChange={(p) => patch({ parcels: { ...cfg.parcels, solar: p } })} /></div>
-            )}
-            {cfg.tech.wind && (
-              <div className="card"><LandParcel kind="wind" onChange={(p) => patch({ parcels: { ...cfg.parcels, wind: p } })} /></div>
-            )}
-          </div>
-        </>
+        <SiteDesigner cfg={cfg} patch={patch} />
       )}
 
       <FlowDesigner cfg={cfg} onTopoChange={handleTopoChange} />
 
-      <Nav go={go} step={step} nextLabel="Continue → Objective" />
+      <Nav go={go} step={step} nextLabel="Continue → Consumer & Load" />
     </>
   );
 }

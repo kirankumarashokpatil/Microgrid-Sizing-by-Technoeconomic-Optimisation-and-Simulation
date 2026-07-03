@@ -326,11 +326,16 @@ def _h_forward_eval(spec, ctx):
     no_pv = pv0 <= 1e-9
     ceiling = ctx.grid_ceiling_mw if ctx.grid_ceiling_mw is not None else ctx.params.site_max_grid_mw
     mode = "peak_shaving" if no_pv else "self_sufficiency"
-    grid_charge = no_pv
+    # Frontend dispatch-policy overrides (params); fall back to the design-derived
+    # default (grid as last resort, grid-charge only for a BESS-only site).
+    priority = tuple(getattr(ctx.params, "dispatch_priority", ()) or ())
+    gc_override = getattr(ctx.params, "allow_grid_charge", None)
+    grid_charge = gc_override if gc_override is not None else no_pv
     flows = run_rule_dispatch(ctx.profiles_df, ctx.params,
                               pv_mw=pv0,
                               bess_mw=ctx.bess_mw, bess_mwh=ctx.bess_mwh,
-                              grid_ceiling_mw=ceiling, mode=mode, allow_grid_charge=grid_charge)
+                              grid_ceiling_mw=ceiling, mode=mode,
+                              allow_grid_charge=grid_charge, priority=priority)
     validate_flows(flows, ctx.params, bess_mwh=ctx.bess_mwh, export_limit_mw=ctx.params.export_limit_mw)
     kpis = compute_flow_kpis(flows, ctx.params.dt_hours)
     design = {"pv_mw": pv0 if not no_pv else 0.0, "bess_mw": ctx.bess_mw,

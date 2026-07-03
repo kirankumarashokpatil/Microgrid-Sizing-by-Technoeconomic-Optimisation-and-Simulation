@@ -1,5 +1,5 @@
-// Step 1 — Project definition: consumer(s), reliability covenant, demand. Loads
-// selected here are the single source of truth — they flow into Step 2's flow
+// Step 2 — Project definition: consumer(s), reliability covenant, demand. Loads
+// selected here are the single source of truth — they feed the Step 1 flow
 // designer as consumer nodes. The demand chart shows the REAL dataset series.
 import { useEffect, useState } from "react";
 import { Nav } from "./shared.jsx";
@@ -43,8 +43,8 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
 
   return (
     <>
-      <div className="pagehead"><h1>Step 1 — Consumer & Load</h1>
-        <p>Define the consumer(s) and demand. These loads flow straight into the Step 2 energy-flow design.</p></div>
+      <div className="pagehead"><h1>Step 2 — Consumer & Load</h1>
+        <p>Define the consumer(s) and demand. These loads feed the energy-flow design from Step 1 as consumer nodes and set the demand the engine sizes against.</p></div>
 
       <div className="card">
         <h3>Project Details</h3>
@@ -59,7 +59,7 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
       <div className="card" style={{ borderColor: "var(--teal)", background: "var(--teal-light)" }}>
         <h3 style={{ color: "var(--teal-dark)" }}>Consumers (select one or more)</h3>
         <div className="hint" style={{ color: "var(--teal-dark)", opacity: 0.8 }}>
-          Each selected load becomes a consumer node in the Step 2 flow designer. Total peak: <b>{fmt.mw(totalPeak)}</b>.
+          Each selected load becomes a consumer node in the Step 1 flow designer. Total peak: <b>{fmt.mw(totalPeak)}</b>.
         </div>
         <div className="choices">
           {Object.entries(LOAD_TYPES).map(([t, m]) => (
@@ -118,7 +118,7 @@ export function Step1Project({ cfg, patch, profile, summary, step, go }) {
         </div>
       </div>
 
-      <Nav go={go} step={step} nextLabel="Continue → Energy System" />
+      <Nav go={go} step={step} nextLabel="Continue → Objective" />
     </>
   );
 }

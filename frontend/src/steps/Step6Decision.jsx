@@ -2,7 +2,7 @@
 // KPI tiles, economics, CAPEX breakdown, the real dispatch chart from the
 // forward-eval flows, and value vs a 100%-grid baseline.
 import { useState } from "react";
-import { NeedRun } from "./shared.jsx";
+import { NeedRun, DispatchPolicyBadge, dispatchPolicy, DISPATCH_LABELS } from "./shared.jsx";
 import { column, exportXlsx } from "../lib/api.js";
 import { linePath, areaPath, downsample, fmt } from "../lib/svg.js";
 import { energyTotals, monthlyDispatch, socSeries, PALETTE } from "../lib/charts.js";
@@ -20,17 +20,25 @@ export function Step6Decision({ cfg, profile, result, flows, step, go }) {
     setExporting(true);
     try {
       const loadPeak = (cfg?.loads || []).reduce((s, l) => s + (+l.peak_mw || 0), 0);
+      const pol = dispatchPolicy(cfg);
       await exportXlsx({
         project_name: cfg?.projectName || "DIP Project",
         scenario_id: result.id, scenario_name: result.name,
         recommended: rec, vs_grid_default: vg, points: eco.points || [],
-        kpis: result.kpis || {}, assumptions: cfg?.econ || {},
+        kpis: result.kpis || {},
+        assumptions: {
+          ...(cfg?.econ || {}),
+          "Dispatch merit order": pol.order.map((a, i) => `${i + 1}. ${DISPATCH_LABELS[a]}`).join("  |  "),
+          "Grid-charging": pol.allowGridCharge == null ? "auto (from objective)" : (pol.allowGridCharge ? "on" : "off"),
+        },
         // inputs so the backend can re-derive each point's per-slot dispatch
         profile_path: profile?.profile_path || null,
         load_peak_mw: loadPeak > 0 ? loadPeak : null,
         pv_mw: rec.pv_mw, wind_mw: rec.wind_mw,
         site_topology: TOPO_MAP[cfg?.topology] || "grid_connected_btm",
         include_timeseries: true,
+        dispatch_priority: pol.custom ? pol.order : [],
+        allow_grid_charge: pol.allowGridCharge,
       });
     } catch (e) { alert("Export failed: " + (e.message || e)); }
     finally { setExporting(false); }
@@ -47,6 +55,8 @@ export function Step6Decision({ cfg, profile, result, flows, step, go }) {
         <Tile cls="t-gc" k="GCmin · Min Grid Connection" v={fmt.mw(rec.gc_mw)} s="residual output" />
         <Tile cls="t-curt" k="Curtailment" v={curt != null ? fmt.pct(curt) : "—"} s="generation spilled" />
       </div>
+
+      <DispatchPolicyBadge cfg={cfg} />
 
       {flows && <>
         <DispatchChart flows={flows} />

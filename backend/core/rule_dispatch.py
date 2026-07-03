@@ -42,6 +42,37 @@ from core.schema import (
 # Model R — causal rule dispatch
 # ──────────────────────────────────────────────────────────────────────────────
 
+# The five atomic transfers the causal controller can perform each timestep.
+# A "dispatch priority" is an ordered subset of these, applied in sequence.
+DISPATCH_ACTIONS = (
+    "gen_to_load",   # 1. direct self-consumption
+    "gen_to_bess",   # 2. charge from SURPLUS generation
+    "bess_to_load",  # 3. discharge to cover residual load
+    "grid_to_load",  # 4. residual import, capped by the connection ceiling
+    "grid_to_bess",  # 5. off-peak valley-fill from headroom below the ceiling
+)
+
+# Built-in orders. The default (self-sufficiency) is the CEO-mandated
+# "grid as last resort" merit order; peak-shaving lets the grid serve the base
+# up to the ceiling first, reserving the battery for the peak above it.
+DEFAULT_PRIORITY = {
+    "self_sufficiency": ("gen_to_load", "gen_to_bess", "bess_to_load", "grid_to_load"),
+    "peak_shaving":     ("gen_to_load", "gen_to_bess", "grid_to_load", "bess_to_load", "grid_to_bess"),
+}
+
+
+def resolve_priority(mode: str, priority=None) -> tuple:
+    """The ordered action list to run: an explicit override, else the mode default.
+    Validates every entry is a known action and that no action repeats."""
+    order = tuple(priority) if priority else DEFAULT_PRIORITY.get(mode, DEFAULT_PRIORITY["self_sufficiency"])
+    unknown = [a for a in order if a not in DISPATCH_ACTIONS]
+    if unknown:
+        raise ValueError(f"unknown dispatch action(s) {unknown}; valid: {DISPATCH_ACTIONS}")
+    if len(set(order)) != len(order):
+        raise ValueError(f"dispatch priority has duplicate actions: {order}")
+    return order
+
+
 def run_rule_dispatch(
     profiles_df: pd.DataFrame,
     params: PhysicalParams,
@@ -52,6 +83,7 @@ def run_rule_dispatch(
     grid_ceiling_mw: float,
     mode: str = "self_sufficiency",
     allow_grid_charge: bool = False,
+    priority=None,
 ) -> pd.DataFrame:
     """
     Simulate the causal BTM merit order over the full profile and return a
@@ -75,8 +107,14 @@ def run_rule_dispatch(
         If True, the BESS may charge from the grid using the headroom below the
         ceiling (Grid → BESS). Per docs/DESIGN_REVIEW.md §1 this is enabled ONLY for
         the no-PV sub-scenario; the main scenarios keep it False ("grid as last
-        resort"). Only meaningful with mode="peak_shaving".
+        resort"). Gates the grid_to_bess action regardless of the priority order.
+    priority :
+        Optional explicit ordered list of DISPATCH_ACTIONS. When None, the mode's
+        DEFAULT_PRIORITY is used — which reproduces the historical hardcoded merit
+        order exactly. Reordering (e.g. grid_to_load before bess_to_load) lets the
+        caller express battery-preservation vs grid-as-last-resort policies.
     """
+    order = resolve_priority(mode, priority)
     dt    = params.dt_hours
     eta_c = params.eff_charge
     eta_d = params.eff_discharge
@@ -103,47 +141,55 @@ def run_rule_dispatch(
         return max(0.0, min(bess_mw - already, by_energy))
 
     for t in range(n):
-        load     = load_arr[t]
-        pv_avail = pv_arr[t]
+        # Per-step causal state, mutated by each action in priority order.
+        residual = load_arr[t]     # load still to serve
+        surplus  = pv_arr[t]       # generation not yet consumed
+        c_gen = c_grid = d = 0.0   # charge-from-gen, charge-from-grid, discharge
+        pv_to_load = 0.0
+        g_used = 0.0               # grid draw so far (toward the ceiling)
 
-        # 1. Generation → Load
-        pv_to_load    = min(pv_avail, load)
-        residual_load = load - pv_to_load
-        pv_surplus    = pv_avail - pv_to_load
+        for action in order:
+            if action == "gen_to_load":
+                x = min(surplus, residual)
+                pv_to_load += x; surplus -= x; residual -= x
 
-        c = d = c_grid = 0.0
-        if pv_surplus > 0.0:
-            # 2. Generation → BESS (surplus only)
-            c = min(pv_surplus, _max_charge(soc, 0.0))
-            soc += c * eta_c * dt
-            curtail[t] = pv_surplus - c
-        elif residual_load > 0.0:
-            # 3. BESS → Load. In peak-shaving mode only shave above the ceiling,
-            #    reserving stored energy for the peaks (causal — no foresight).
-            want_d = residual_load if mode != "peak_shaving" else max(0.0, residual_load - grid_ceiling_mw)
-            avail_energy    = soc - soc_min
-            max_d_by_energy = avail_energy * eta_d / dt if dt > 0 else 0.0
-            d = min(want_d, bess_mw, max(0.0, max_d_by_energy))
-            soc -= d / eta_d * dt
-            residual_load -= d
+            elif action == "gen_to_bess":
+                if surplus > 0.0:
+                    x = min(surplus, _max_charge(soc, c_gen + c_grid))
+                    soc += x * eta_c * dt
+                    c_gen += x; surplus -= x
 
-        # 4. Grid → Load (capped by the connection ceiling; rest is shed)
-        g = min(residual_load, grid_ceiling_mw)
-        shed = residual_load - g
+            elif action == "bess_to_load":
+                if residual > 0.0:
+                    # Peak-shaving reserves stored energy for the peak: only shave
+                    # load above the ceiling that the grid can't already carry.
+                    want = residual if mode != "peak_shaving" else max(0.0, residual - (grid_ceiling_mw - g_used))
+                    max_d_by_energy = (soc - soc_min) * eta_d / dt if dt > 0 else 0.0
+                    x = min(want, bess_mw - d, max(0.0, max_d_by_energy))
+                    soc -= x / eta_d * dt
+                    d += x; residual -= x
 
-        # 4b. Grid → BESS (gated): charge from the headroom below the ceiling.
-        #     Only when not discharging this step (load below the ceiling).
-        if allow_grid_charge and d == 0.0 and pv_surplus <= 0.0:
-            headroom = grid_ceiling_mw - g
-            if headroom > 0.0:
-                c_grid = min(headroom, _max_charge(soc, c))
-                soc += c_grid * eta_c * dt
+            elif action == "grid_to_load":
+                x = min(residual, grid_ceiling_mw - g_used)   # capped by the connection
+                g_used += x; residual -= x
 
-        pv_used[t]   = pv_to_load + c
-        charge[t]    = c + c_grid
+            elif action == "grid_to_bess":
+                # Valley-fill only when load is fully covered (never charge while
+                # shedding or discharging) — keeps grid a last resort and preserves
+                # the no-simultaneous-charge/discharge invariant for any ordering.
+                if allow_grid_charge and residual <= 1e-9:
+                    headroom = grid_ceiling_mw - g_used
+                    if headroom > 0.0:
+                        x = min(headroom, _max_charge(soc, c_gen + c_grid))
+                        soc += x * eta_c * dt
+                        c_grid += x; g_used += x
+
+        pv_used[t]   = pv_to_load + c_gen
+        charge[t]    = c_gen + c_grid
         discharge[t] = d
-        grid_imp[t]  = g + c_grid
-        unmet[t]     = shed
+        grid_imp[t]  = g_used
+        curtail[t]   = surplus       # generation left unused after all gen actions
+        unmet[t]     = residual      # load left unserved after all sources
         soc_out[t]   = soc
 
     return pd.DataFrame({
@@ -386,13 +432,17 @@ def size_by_bisection(
     # ALL peak-shaving runs, with or without PV (the spec allows Grid → BESS when
     # load < grid). Was previously gated to the no-PV sub-scenario only.
     rule_mode = "peak_shaving" if target_type == "peak_shaving" else "self_sufficiency"
-    grid_charge = (rule_mode == "peak_shaving")
+    # Frontend overrides (params); fall back to the mode-derived policy.
+    priority = tuple(getattr(params, "dispatch_priority", ()) or ())
+    gc_override = getattr(params, "allow_grid_charge", None)
+    grid_charge = gc_override if gc_override is not None else (rule_mode == "peak_shaving")
 
     def meets(bess_mw: float, bess_mwh: float) -> tuple[bool, dict]:
         flows = run_rule_dispatch(
             profiles_df, params,
             pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
             grid_ceiling_mw=ceiling, mode=rule_mode, allow_grid_charge=grid_charge,
+            priority=priority,
         )
         k = compute_flow_kpis(flows, params.dt_hours)
         if target_type == "ssr":
@@ -470,11 +520,14 @@ def verify_sizing_with_rule(
     without PV.
     """
     mode = _mode_for(target_type)
-    grid_charge = (mode == "peak_shaving")
+    priority = tuple(getattr(params, "dispatch_priority", ()) or ())
+    gc_override = getattr(params, "allow_grid_charge", None)
+    grid_charge = gc_override if gc_override is not None else (mode == "peak_shaving")
     flows = run_rule_dispatch(
         profiles_df, params,
         pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
         grid_ceiling_mw=grid_ceiling_mw, mode=mode, allow_grid_charge=grid_charge,
+        priority=priority,
     )
     validate_flows(flows, params, bess_mwh=bess_mwh, export_limit_mw=params.export_limit_mw)
     return compute_flow_kpis(flows, params.dt_hours), flows
