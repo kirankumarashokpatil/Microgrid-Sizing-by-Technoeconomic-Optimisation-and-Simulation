@@ -151,6 +151,61 @@ land → solve → scenarios spine before the keystone LP change in Phase 03.
 
 ---
 
+## Phase 03 formulation (scoped against the real LP)
+
+The LP is `core/sizing_engine.py::_build_lp`. Today **PV is a constant array** —
+`pv_avail = df["pv_pu"] * pv_mw_fixed` (line ~302), used in the availability
+constraint `p_pv[t] + p_curt[t] == pv_avail[t]` (line ~318). BESS (`bess_mw`,
+`bess_mwh`) are the only hardware variables. The change is small and stays linear:
+
+**1. Promote PV to a variable** (line ~281 block)
+```python
+m.pv_mw = pyo.Var(within=NonNegativeReals, bounds=(0, pv_max_mw))   # pv_max = ρ_s · A_avail
+```
+**2. Rewrite the availability constraint** (line ~318) — still linear (`pv_pu[t]` is a constant coefficient):
+```python
+m.p_pv[t] + m.p_curt[t] == df["pv_pu"][t] * m.pv_mw        # was: == pv_avail[t]
+```
+**3. Add the hard land budget** (new constraint) — this is scenario **S101**:
+```python
+m.land_con = Constraint(expr= m.pv_mw/ρ_s + m.bess_mwh/ρ_b_energy <= A_avail)
+```
+**4. New objective** for the PV-variable family (see decision below). SSR target
+constraint (line ~380) is unchanged — it already bounds grid+unmet.
+
+**Entry point:** add a `target_type="pv_bess_ssr"` branch (+ params `pv_max_mw`,
+`available_land_ha`, densities) to `_build_lp` and a thin `solve_pvbess_point()`
+alongside `solve_sizing_point()`. Extract `pv_mw` from the solution like `bess_mw`.
+
+**Scope note — solar-only first.** Wind is currently folded into `pv_pu` upstream
+in `/run`. Keeping **wind fixed and making only solar variable** (Italy is
+solar-dominant) clears S61/S81/S101 with the minimal change; a separate `wind_mw`
+variable + `wind_pu` column is a later slice.
+
+**Clears:** S61, S81 (→ ready), S101 (site-area cap), and is the basis for S53/S54/
+S63/S72/S82/S103/S122.
+
+**The objective — resolved by the developer's actual need.** They want the
+*cheapest* design that hits the SSR target within the land they already own. The
+PV-vs-BESS split is therefore **inherently economic** — physics-only objectives
+fail: "min land" is perverse (BESS is land-dense ~15 MW/ha vs solar ~0.9, so it
+builds a tiny battery + almost no solar), and "min PV+BESS" hides a price in its
+weights.
+
+**Chosen approach — outer PV sweep over the existing cost model (not an LP-objective
+rewrite):**
+1. Sweep `pv_mw` across `[0, ρ_s·A_avail]` (the land ceiling).
+2. For each, run the **existing** BESS-for-SSR LP (`solve_sizing_point`, target=ssr).
+3. **Cost each** with the existing Phase-2 overlay (`economic_overlay.evaluate_costs`
+   / `find_optimal_point`), incl. grid-connection CapEx.
+4. Return the **cost-optimal split** + the full frontier (PV → cost → SSR).
+Reuses validated code (BESS-LP + economics + the ready S62 PV×SSR surface); low
+risk, orchestration-only — like `/design`. Naturally supports "use less land".
+
+**End-state (later):** the single coupled LP with cost inside (option C above) —
+promote `pv_mw` per §Phase 03 steps 1–3 with a cost objective — consolidating the
+sweep into one solve once it's proven.
+
 ## Open decisions (pin before building)
 
 1. **Stage-1 objective** — min cost to hit SSR target *(recommended)* vs min land.
