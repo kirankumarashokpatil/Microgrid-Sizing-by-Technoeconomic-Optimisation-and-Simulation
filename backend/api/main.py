@@ -57,7 +57,7 @@ from core.economic_overlay import (                          # noqa: E402
     evaluate_costs, find_optimal_point,
 )
 from core.resolver import resolve_scenario                   # noqa: E402
-from core.site import parcel_capacity, area_for_capacity     # noqa: E402
+from core.site import parcel_capacity, area_for_capacity, _SOLAR_MW_PER_HA  # noqa: E402
 from core.boundary import parse_boundary                      # noqa: E402
 from core.schema import CurveCols, KpiKeys                   # noqa: E402
 from core.scenarios import (                                 # noqa: E402
@@ -1001,6 +1001,88 @@ def design(req: DesignRequest) -> dict:
             "target_ssr_pct": req.target_ssr_pct, "available_land_ha": req.available_land_ha,
         },
         "scenarios": scenarios,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Split optimiser (Phase 3, sweep) — cheapest PV/BESS split within the land
+# ──────────────────────────────────────────────────────────────────────────────
+class OptimiseSplitRequest(BaseModel):
+    """Land-first split optimiser. Sweep the solar allocation across the land the
+    developer owns, size BESS for the SSR target at each point (existing LP), cost
+    each with the same inputs as the Phase-2 overlay, and return the cheapest split
+    plus the frontier. 'The tool decides the split' — with cost as the arbiter.
+
+    Solar-only sweep for now (wind fixed); the coupled cost-LP is the end-state."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    available_land_ha: float = 184.0        # land available to GENERATION (net of load/reserved)
+    target_ssr_pct: float = 90.0
+    wind_mw: float = 0.0                     # fixed wind nameplate (MW)
+    steps: int = 8                           # sweep resolution (PV points)
+    site_topology: Optional[str] = "grid_connected_btm"
+    # Cost inputs — mirror EconomicParams so the ranking matches the Phase-2 overlay.
+    cost_pv_mw: float = 700_000.0
+    cost_wind_mw: float = 1_300_000.0
+    cost_bess_mw: float = 150_000.0
+    cost_bess_mwh: float = 300_000.0
+    grid_connection_cost_mw: float = 250_000.0
+    grid_cost_mwh: float = 150.0
+    fixed_opex_per_mwh_year: float = 8_000.0
+    project_lifespan_years: float = 20.0
+
+
+@app.post("/optimise-split")
+def optimise_split(req: OptimiseSplitRequest) -> dict:
+    """Sweep PV over [0, ρ_s·A_avail], size BESS for the SSR target at each point,
+    cost each, and return the cost-optimal split + the frontier."""
+    pv_ceiling = _SOLAR_MW_PER_HA * max(0.0, req.available_land_ha)
+    steps = max(2, min(int(req.steps), 20))
+    pv_points = [round(pv_ceiling * i / (steps - 1), 2) for i in range(steps)]
+
+    frontier = []
+    for pv in pv_points:
+        try:
+            out = run(RunRequest(
+                scenario_id="S11_BTM_SSR_TARGET_BESS", profile_path=req.profile_path,
+                load_peak_mw=req.load_peak_mw, pv_mw=pv, wind_mw=req.wind_mw,
+                target_ssr_pct=req.target_ssr_pct, site_topology=req.site_topology,
+            ))
+        except Exception:
+            continue
+        if not out.get("feasible"):
+            continue
+        d = out.get("design") or {}
+        k = out.get("kpis") or {}
+        bess_mw = d.get("bess_mw", 0.0) or 0.0
+        bess_mwh = d.get("bess_mwh", 0.0) or 0.0
+        grid_mw = k.get("GCmin Peak (MW)", d.get("gc_mw", 0.0)) or 0.0
+        grid_import = k.get("Total Grid Import (MWh)", 0.0) or 0.0
+
+        capex = (pv * req.cost_pv_mw + req.wind_mw * req.cost_wind_mw
+                 + bess_mw * req.cost_bess_mw + bess_mwh * req.cost_bess_mwh
+                 + grid_mw * req.grid_connection_cost_mw)
+        annual = grid_import * req.grid_cost_mwh + bess_mwh * req.fixed_opex_per_mwh_year
+        lifetime = capex + req.project_lifespan_years * annual
+
+        frontier.append({
+            "pv_mw": pv, "wind_mw": req.wind_mw,
+            "pv_land_ha": round(pv / _SOLAR_MW_PER_HA, 1) if _SOLAR_MW_PER_HA else None,
+            "bess_mw": round(bess_mw, 1), "bess_mwh": round(bess_mwh, 1),
+            "grid_mw": round(grid_mw, 2), "ssr_pct": k.get("SSR (%)"),
+            "capex_m": round(capex / 1e6, 2),
+            "lifetime_cost_m": round(lifetime / 1e6, 2),
+        })
+
+    best = min(frontier, key=lambda r: r["lifetime_cost_m"]) if frontier else None
+    return {
+        "inputs": {
+            "available_land_ha": req.available_land_ha, "load_peak_mw": req.load_peak_mw,
+            "target_ssr_pct": req.target_ssr_pct, "wind_mw": req.wind_mw,
+        },
+        "pv_ceiling_mw": round(pv_ceiling, 1),
+        "recommended": best,
+        "frontier": frontier,
     }
 
 

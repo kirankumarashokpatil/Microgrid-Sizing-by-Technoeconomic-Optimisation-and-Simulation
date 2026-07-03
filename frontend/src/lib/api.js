@@ -90,6 +90,15 @@ export const runDesign = (payload) =>
     body: JSON.stringify(payload),
   }).then(handle);
 
+// Split optimiser (Phase 3, sweep): the tool decides the cost-optimal solar/BESS
+// split within the available land → { recommended, frontier, pv_ceiling_mw }.
+export const runOptimiseSplit = (payload) =>
+  fetch(`${BASE}/optimise-split`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(handle);
+
 // Download an .xlsx workbook of the current result (built server-side, no re-run).
 export async function exportXlsx(payload) {
   const res = await fetch(`${BASE}/export`, {

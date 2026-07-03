@@ -142,7 +142,7 @@ optimiser). **Build-first easy case:** `S11 / S00` with generation fixed from th
 | **00** | Land capture ✅ | `SiteDesigner`, `boundary.py` | done |
 | **01** | **Evaluation core** — land → existing solve × (with/without BESS) → scenario array. Backend `POST /design` ✅ + `runDesign()` client ✅ (branch `feat/giga-park-land-first`); frontend comparison view pending | #5, #2 (A_avail) | **in progress** |
 | **02** | Reciprocal `[Area\|MW]` control ✅ + DC demand as up-front anchor on the Energy System screen ✅ | #2, #3, #7 | done |
-| **03** | **PV/wind variable + land budget** → split optimiser; finish `needs_pv_variable` | **#1**, #4 | L |
+| **03** | Split optimiser (sweep) ✅ — `POST /optimise-split` sweeps PV over the land, sizes BESS per point, costs each, returns the cost-optimal split + frontier (`runOptimiseSplit()` client). Frontend frontier view + the coupled cost-LP consolidation pending | **#1**, #4 | in progress |
 | **04** | Existing plant, surplus (Stage 2), grid/economics realism | #6 | M |
 | **05** | Decision pack — proposed layout on map, KPIs, sensitivity, export | #7 | M |
 
