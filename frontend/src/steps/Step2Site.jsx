@@ -15,6 +15,13 @@ export function Step2Site({ cfg, patch, step, go }) {
   const toggle = (k) => patch({ tech: { ...cfg.tech, [k]: !cfg.tech[k] } });
   const drawsParcel = cfg.tech.solar || cfg.tech.wind;
 
+  // Data-centre demand is the anchor the whole design is sized to meet — captured
+  // up-front here (per the Giga Park framing), then refined in the Consumer step.
+  const loads = cfg.loads || [];
+  const dcIdx = Math.max(0, loads.findIndex((l) => l.load_type === "data_centre"));
+  const dc = loads[dcIdx];
+  const setDc = (k, v) => patch({ loads: loads.map((l, i) => (i === dcIdx ? { ...l, [k]: +v } : l)) });
+
   // The FlowDesigner derives topology from the flow graph and hands it up here.
   function handleTopoChange(topo) {
     const sig = topo.signals || {};
@@ -29,7 +36,31 @@ export function Step2Site({ cfg, patch, step, go }) {
   return (
     <>
       <div className="pagehead"><h1>Step 1 — Energy System</h1>
-        <p>Start from the land: import or draw the parcel, choose the technologies, and design the energy flow. The system topology is derived from your flow design and drives the objective. You define the consumers next.</p></div>
+        <p>Start from the land and the demand: set the data-centre requirement, import or draw the parcel, choose the technologies, and design the energy flow. The topology is derived from your flow design and drives the objective.</p></div>
+
+      {dc && (
+        <div className="card" style={{ borderColor: "var(--teal)", background: "var(--teal-light)" }}>
+          <h3 style={{ color: "var(--teal-dark)" }}>🖥️ Data-centre demand
+            <span style={{ marginLeft: 8, fontSize: 10.5, fontWeight: 700, letterSpacing: ".04em",
+              textTransform: "uppercase", color: "#15616d", background: "#fff",
+              border: "1px solid #bcd6d9", borderRadius: 6, padding: "2px 7px", verticalAlign: "middle" }}>
+              the anchor
+            </span>
+          </h3>
+          <div className="hint" style={{ color: "var(--teal-dark)", opacity: 0.85 }}>
+            The power requirement the whole design is sized to meet. Set it up-front here; add or refine other consumers
+            (ports, EV hubs…) in the Consumer &amp; Load step.
+          </div>
+          <div className="row">
+            <div><label className="fld">Peak demand (MW)</label>
+              <input type="number" min="0" value={dc.peak_mw}
+                     onChange={(e) => setDc("peak_mw", e.target.value)} /></div>
+            <div><label className="fld">Baseline demand (MW)</label>
+              <input type="number" min="0" value={dc.baseline_mw}
+                     onChange={(e) => setDc("baseline_mw", e.target.value)} /></div>
+          </div>
+        </div>
+      )}
 
       <div className="card">
         <h3>Technologies to consider</h3>

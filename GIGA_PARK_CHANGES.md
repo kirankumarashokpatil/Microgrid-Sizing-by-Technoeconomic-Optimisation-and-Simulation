@@ -141,7 +141,7 @@ optimiser). **Build-first easy case:** `S11 / S00` with generation fixed from th
 |---|---|---|---|
 | **00** | Land capture ✅ | `SiteDesigner`, `boundary.py` | done |
 | **01** | **Evaluation core** — land → existing solve × (with/without BESS) → scenario array. Backend `POST /design` ✅ + `runDesign()` client ✅ (branch `feat/giga-park-land-first`); frontend comparison view pending | #5, #2 (A_avail) | **in progress** |
-| **02** | Reciprocal `[Area\|MW]` control ✅ (backend `capacity-from-mw` + `area_for_capacity`; SiteDesigner `GenSizer` reshapes polygon); **DC demand up-front pending** | #2, #3, #7 | in progress |
+| **02** | Reciprocal `[Area\|MW]` control ✅ + DC demand as up-front anchor on the Energy System screen ✅ | #2, #3, #7 | done |
 | **03** | **PV/wind variable + land budget** → split optimiser; finish `needs_pv_variable` | **#1**, #4 | L |
 | **04** | Existing plant, surplus (Stage 2), grid/economics realism | #6 | M |
 | **05** | Decision pack — proposed layout on map, KPIs, sensitivity, export | #7 | M |
