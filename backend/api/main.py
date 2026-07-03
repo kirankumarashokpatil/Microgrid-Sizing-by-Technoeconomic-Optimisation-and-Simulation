@@ -1040,8 +1040,26 @@ def optimise_split(req: OptimiseSplitRequest) -> dict:
     steps = max(2, min(int(req.steps), 20))
     pv_points = [round(pv_ceiling * i / (steps - 1), 2) for i in range(steps)]
 
+    # Analytic feasibility floor: a battery only SHIFTS energy, never creates it, so
+    # solar must generate at least the self-supplied share of demand. PV below this
+    # can't reach the target — skip the (slow) solve instead of proving it infeasible.
+    pv_floor = 0.0
+    try:
+        df0, _, _, dt0 = _load_profile(req.profile_path or str(_DEFAULT_PROFILE))
+        load0 = df0["load_mw"]
+        if req.load_peak_mw and float(load0.max()) > 1e-9:
+            load0 = load0 * (req.load_peak_mw / float(load0.max()))
+        pv_energy_per_mw = float(df0["pv_pu"].sum()) * dt0          # MWh/yr per MW solar
+        wind_energy = req.wind_mw * float(df0.get("wind_pu", pd.Series([0])).sum()) * dt0
+        need = (req.target_ssr_pct / 100.0) * float(load0.sum()) * dt0 - wind_energy
+        pv_floor = max(0.0, need / pv_energy_per_mw) if pv_energy_per_mw > 1e-9 else 0.0
+    except Exception:
+        pv_floor = 0.0
+
     frontier = []
     for pv in pv_points:
+        if pv + 1e-6 < pv_floor:      # cannot reach target on energy grounds — skip
+            continue
         try:
             out = run(RunRequest(
                 scenario_id="S11_BTM_SSR_TARGET_BESS", profile_path=req.profile_path,
@@ -1081,6 +1099,7 @@ def optimise_split(req: OptimiseSplitRequest) -> dict:
             "target_ssr_pct": req.target_ssr_pct, "wind_mw": req.wind_mw,
         },
         "pv_ceiling_mw": round(pv_ceiling, 1),
+        "pv_floor_mw": round(pv_floor, 1),
         "recommended": best,
         "frontier": frontier,
     }

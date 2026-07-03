@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Nav } from "./shared.jsx";
 import { DesignScenarios } from "./DesignScenarios.jsx";
+import { SplitOptimiser } from "./SplitOptimiser.jsx";
 import { runScenario, resolveScenario, getScenarios } from "../lib/api.js";
 import { fmt } from "../lib/svg.js";
 
@@ -184,6 +185,8 @@ export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
         <p>The optimiser sizes the system under the causal dispatch rule and derives the residual grid connection. Real engine, real dataset.</p></div>
 
       <DesignScenarios cfg={cfg} profile={profile} summary={summary} />
+
+      <SplitOptimiser cfg={cfg} profile={profile} />
 
       <DetectPanel detected={detected} scenarios={scenarios}
                    override={override} setOverride={setOverride}
