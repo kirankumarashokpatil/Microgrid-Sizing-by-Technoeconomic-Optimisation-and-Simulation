@@ -3,6 +3,7 @@
 // Everything downstream (Steps 5–6, metric strip) reads what this produces.
 import { useEffect, useRef, useState } from "react";
 import { Nav } from "./shared.jsx";
+import { DesignScenarios } from "./DesignScenarios.jsx";
 import { runScenario, resolveScenario, getScenarios } from "../lib/api.js";
 import { fmt } from "../lib/svg.js";
 
@@ -181,6 +182,8 @@ export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
     <>
       <div className="pagehead"><h1>Step 4 — Size</h1>
         <p>The optimiser sizes the system under the causal dispatch rule and derives the residual grid connection. Real engine, real dataset.</p></div>
+
+      <DesignScenarios cfg={cfg} profile={profile} summary={summary} />
 
       <DetectPanel detected={detected} scenarios={scenarios}
                    override={override} setOverride={setOverride}
