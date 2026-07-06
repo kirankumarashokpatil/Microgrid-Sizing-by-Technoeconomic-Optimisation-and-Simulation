@@ -45,6 +45,11 @@ def solve_sizing_point(
     target_gc_mw: float | None = None,
     scenario_label: str = "",
     solver_time_limit: int = 120,
+    pv_variable: bool = False,
+    pv_max_mw: float | None = None,
+    pv_weight: float = 700.0 / 300.0,
+    bess_fixed_mw: float | None = None,
+    bess_fixed_mwh: float | None = None,
 ) -> SizingResult:
     """
     Solve ONE sizing LP for a specific target and return a SizingResult.
@@ -59,6 +64,21 @@ def solve_sizing_point(
     pv_mw_fixed : float
         PV nameplate size (MW) — fixed input.
         Set to 0.0 for sub-scenario (BESS-only, no generation).
+        Ignored when pv_variable=True (PV becomes an LP decision variable).
+    pv_variable : bool
+        Promote PV nameplate to an LP decision variable (the registry's
+        NEEDS_PV_VARIABLE capability). The objective gains pv_weight·pv_mw so
+        the LP trades PV against BESS.
+    pv_max_mw : float | None
+        Upper bound on the PV variable — the land/site ceiling (ρ_s·A_avail).
+        None ⇒ a generous default (20× peak load).
+    pv_weight : float
+        Objective weight of 1 MW PV relative to 1 MWh BESS. Default mirrors the
+        default CAPEX ratio (€700k/MW PV ÷ €300k/MWh BESS) so "min PV+BESS"
+        approximates min CAPEX; callers can pass their own ratio.
+    bess_fixed_mw / bess_fixed_mwh : float | None
+        Pin the BESS to a given size (equality constraints) — used by frontier
+        sweeps that vary BESS externally.
     target_type : str
         "ssr"           → SSR target sizing (minimise BESS_MWh)
         "peak_shaving"  → Grid connection target (minimise BESS_MW)
@@ -78,7 +98,9 @@ def solve_sizing_point(
     """
     _validate_inputs(df, params, pv_mw_fixed, target_type, target_value)
 
-    model = _build_lp(df, params, pv_mw_fixed, target_type, target_value, target_gc_mw)
+    model = _build_lp(df, params, pv_mw_fixed, target_type, target_value, target_gc_mw,
+                      pv_variable=pv_variable, pv_max_mw=pv_max_mw, pv_weight=pv_weight,
+                      bess_fixed_mw=bess_fixed_mw, bess_fixed_mwh=bess_fixed_mwh)
     solver = create_highs_solver(time_limit_seconds=solver_time_limit)
     results = None
     try:
@@ -117,6 +139,8 @@ def solve_sizing_point(
     bess_mw  = max(0.0, pyo.value(model.bess_mw))
     bess_mwh = max(0.0, pyo.value(model.bess_mwh))
     duration = (bess_mwh / bess_mw) if bess_mw > 1e-3 else 0.0
+    # Realized PV: the LP's choice when variable, else the fixed input.
+    realized_pv = max(0.0, pyo.value(model.pv_mw_var)) if pv_variable else pv_mw_fixed
 
     # Verify achieved SSR from LP variables
     dt = params.dt_hours
@@ -135,7 +159,7 @@ def solve_sizing_point(
 
     # Self-consumption ratio (SCR) = PV used on-site / PV available.
     # First-class output per the CEO Strategic Brief (SCR alongside SSR).
-    total_pv_avail_mwh = sum(df["pv_pu"].iloc[t] for t in model.T) * pv_mw_fixed * dt
+    total_pv_avail_mwh = sum(df["pv_pu"].iloc[t] for t in model.T) * realized_pv * dt
     total_pv_used_mwh  = sum(max(0.0, pyo.value(model.p_pv[t])) for t in model.T) * dt
     achieved_scr = (
         total_pv_used_mwh / total_pv_avail_mwh * 100.0
@@ -144,7 +168,7 @@ def solve_sizing_point(
 
     return SizingResult(
         scenario_name=scenario_label,
-        pv_mw=pv_mw_fixed,
+        pv_mw=round(realized_pv, 4),
         bess_mw=round(bess_mw, 4),
         bess_mwh=round(bess_mwh, 4),
         peak_grid_mw=round(peak_grid, 4),
@@ -210,10 +234,15 @@ def find_gc_min(
     params: PhysicalParams,
     pv_mw_fixed: float,
     solver_time_limit: int = 120,
+    bess_fixed_mw: float | None = None,
+    bess_fixed_mwh: float | None = None,
 ) -> float:
     """
     Find the minimum possible grid connection (MW) with maximum BESS and PV.
     This is the lower bound for the peak-shaving curve sweep.
+
+    Pass bess_fixed_mw/mwh to pin the battery instead (the S55 frontier sweeps
+    BESS sizes externally and asks for GCmin at each).
 
     Returns the minimum achievable peak grid import in MW.
     """
@@ -221,6 +250,8 @@ def find_gc_min(
         df, params, pv_mw_fixed,
         target_type="find_min_gc",
         target_value=0.0,       # no target — free to minimise peak
+        bess_fixed_mw=bess_fixed_mw,
+        bess_fixed_mwh=bess_fixed_mwh,
     )
     solver = create_highs_solver(time_limit_seconds=solver_time_limit)
     results = None
@@ -260,6 +291,11 @@ def _build_lp(
     target_type: str,
     target_value: float,
     target_gc_mw: float | None = None,
+    pv_variable: bool = False,
+    pv_max_mw: float | None = None,
+    pv_weight: float = 700.0 / 300.0,
+    bess_fixed_mw: float | None = None,
+    bess_fixed_mwh: float | None = None,
 ) -> pyo.ConcreteModel:
     """
     Build the Pyomo LP model.
@@ -280,6 +316,11 @@ def _build_lp(
     # ── Decision variables (hardware — scalars) ───────────────────────────
     m.bess_mw  = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mw))
     m.bess_mwh = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mwh))
+    # Pin BESS when a frontier sweep sizes it externally.
+    if bess_fixed_mw is not None:
+        m.bess_mw_fix = pyo.Constraint(expr=m.bess_mw == max(0.0, bess_fixed_mw))
+    if bess_fixed_mwh is not None:
+        m.bess_mwh_fix = pyo.Constraint(expr=m.bess_mwh == max(0.0, bess_fixed_mwh))
 
     # ── Decision variables (time-series — one per timestep) ───────────────
     m.p_pv   = pyo.Var(m.T, within=pyo.NonNegativeReals)   # PV power used (MW)
@@ -299,7 +340,16 @@ def _build_lp(
         load_mw = df["load_mw"].values
         total_demand_mwh = load_mw.sum() * dt
 
-    pv_avail = df["pv_pu"].values * pv_mw_fixed    # available PV (MW)
+    pv_pu = df["pv_pu"].values
+    pv_avail = pv_pu * pv_mw_fixed                 # available PV (MW) — fixed-PV case
+
+    # ── PV as a decision variable (NEEDS_PV_VARIABLE capability) ──────────
+    # pv_pu[t] is a constant coefficient, so pv_pu[t]·pv_mw_var stays linear.
+    if pv_variable:
+        peak_load = float(load_mw.max()) if n else 0.0
+        pv_ub = pv_max_mw if (pv_max_mw is not None and pv_max_mw > 0) \
+            else max(1000.0, peak_load * 20.0)
+        m.pv_mw_var = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, pv_ub))
 
     # ── Site Topology Constraints ─────────────────────────────────────────
     if params.site_topology == "off_grid":
@@ -315,8 +365,12 @@ def _build_lp(
     m.balance_con = pyo.Constraint(m.T, rule=balance_rule)
 
     # ── Constraint 2: PV availability + curtailment accounting ────────────
-    def pv_avail_rule(m, t):
-        return m.p_pv[t] + m.p_curt[t] == pv_avail[t]
+    if pv_variable:
+        def pv_avail_rule(m, t):
+            return m.p_pv[t] + m.p_curt[t] == pv_pu[t] * m.pv_mw_var
+    else:
+        def pv_avail_rule(m, t):
+            return m.p_pv[t] + m.p_curt[t] == pv_avail[t]
     m.pv_avail_con = pyo.Constraint(m.T, rule=pv_avail_rule)
 
     # ── Constraint 3: Export Limits ───────────────────────────────────────
@@ -404,33 +458,52 @@ def _build_lp(
         max_unmet = (1.0 - target_value / 100.0) * total_demand_mwh
         m.firmness_con = pyo.Constraint(expr=unmet_mwh <= max_unmet)
 
-    elif target_type == "curtailment":
-        # target_value is the allowable curtailment % (e.g. 5.0 means max 5% of PV is curtailed)
-        total_pv = sum(pv_avail) * dt
+    elif target_type in ("curtailment", "export_max"):
+        # target_value is the allowable curtailment % (e.g. 5.0 means max 5% of PV is curtailed).
+        # With PV variable, total PV is a linear expression of pv_mw_var — still an LP.
         curt_mwh = sum(m.p_curt[t] for t in m.T) * dt
-        max_curt = (target_value / 100.0) * total_pv
-        m.curtailment_con = pyo.Constraint(expr=curt_mwh <= max_curt)
+        if pv_variable:
+            total_pv_expr = float(pv_pu.sum()) * dt * m.pv_mw_var
+        else:
+            total_pv_expr = sum(pv_avail) * dt
+        m.curtailment_con = pyo.Constraint(
+            expr=curt_mwh <= (target_value / 100.0) * total_pv_expr)
 
     # The BESS is allowed to use full site limits.
 
     # ── Objective ─────────────────────────────────────────────────────────
+    # With PV variable, the objective gains pv_weight·pv_mw so the LP trades PV
+    # against BESS (weight defaults to the CAPEX ratio ⇒ ≈ min-CAPEX design).
+    pv_term = (pv_weight * m.pv_mw_var) if pv_variable else 0.0
+
     if target_type in ("ssr", "co_opt", "firmness", "curtailment"):
-        # Primary: minimise BESS_MWh. Tie-breaker: small weight on BESS_MW.
+        # Primary: minimise BESS_MWh (+ weighted PV when variable).
+        # Tie-breaker: small weight on BESS_MW.
         # Tiny reward for export so solver prefers exporting to curtailing when allowed.
         def obj_rule(m):
             unmet_penalty = sum(m.p_unmet[t] for t in m.T) * 1e6
             anti_proc     = -sum(m.e_bess[t] for t in m.T) * 1e-6
             export_reward = -sum(m.p_export[t] for t in m.T) * 1e-4
-            return m.bess_mwh + 0.001 * m.bess_mw + unmet_penalty + anti_proc + export_reward
+            return m.bess_mwh + 0.001 * m.bess_mw + pv_term + unmet_penalty + anti_proc + export_reward
         m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
 
     elif target_type == "peak_shaving":
-        # Primary: minimise BESS_MW. Tie-breaker: small weight on BESS_MWh.
+        # Primary: minimise BESS_MW (+ weighted PV when variable).
         def obj_rule(m):
             unmet_penalty = sum(m.p_unmet[t] for t in m.T) * 1e6
             anti_proc     = -sum(m.e_bess[t] for t in m.T) * 1e-6
             export_reward = -sum(m.p_export[t] for t in m.T) * 1e-4
-            return m.bess_mw + 0.001 * m.bess_mwh + unmet_penalty + anti_proc + export_reward
+            return m.bess_mw + 0.001 * m.bess_mwh + pv_term + unmet_penalty + anti_proc + export_reward
+        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    elif target_type == "export_max":
+        # Standalone generation sizing: maximise usable export within the export
+        # limit, holding curtailment ≤ target% (constraint above). PV growth is
+        # bounded by the curtailment cap, so the LP is bounded.
+        def obj_rule(m):
+            total_export = sum(m.p_export[t] for t in m.T) * dt
+            size_penalty = (m.bess_mwh + m.bess_mw) * 1e-4 + pv_term * 1e-4
+            return -total_export + size_penalty
         m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
 
     elif target_type == "find_max_ssr":
@@ -472,7 +545,8 @@ def _validate_inputs(
     target_type: str,
     target_value: float,
 ) -> None:
-    valid_types = {"ssr", "peak_shaving", "find_max_ssr", "find_min_gc", "co_opt", "firmness", "curtailment"}
+    valid_types = {"ssr", "peak_shaving", "find_max_ssr", "find_min_gc", "co_opt",
+                   "firmness", "curtailment", "export_max"}
     if target_type not in valid_types:
         raise ValueError(f"target_type must be one of {valid_types}, got '{target_type}'")
     if "load_mw" not in df.columns or "pv_pu" not in df.columns:

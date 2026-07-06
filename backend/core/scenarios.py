@@ -379,6 +379,425 @@ def _h_deliverable(spec, ctx):
                           notes="Deliverable size meets the target under the causal rule.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PV-variable handlers — PV promoted to an LP decision variable (family B/C/F).
+# ctx.pv_mw, when > 0, is the LAND CEILING on the PV variable (ρ_s·A_avail from
+# the parcel), not a fixed nameplate: the engine chooses PV within it.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pv_cap(ctx) -> float | None:
+    """The PV upper bound for PV-variable solves: the parcel/land ceiling when
+    the caller supplied one, else None (engine default)."""
+    return ctx.pv_mw if ctx.pv_mw and ctx.pv_mw > 0 else None
+
+
+def _h_pv_ssr(spec, ctx):
+    """S53/S61/S81 — LP co-chooses PV + BESS for an SSR target (min ≈CAPEX)."""
+    from core.sizing_engine import solve_sizing_point
+    res = solve_sizing_point(ctx.profiles_df, ctx.params, 0.0, "ssr", ctx.target_ssr_pct,
+                             scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    out = _point_from_sizing(spec, res, ctx)
+    out.notes = (out.notes + " PV chosen by the LP (weight = default CAPEX ratio).").strip()
+    return out
+
+
+def _h_pv_gc(spec, ctx):
+    """S63 — LP co-chooses PV + BESS to hold a grid-connection ceiling."""
+    from core.sizing_engine import solve_sizing_point
+    gc = ctx.target_gc_mw if ctx.target_gc_mw is not None \
+        else round(float(ctx.profiles_df["load_mw"].max()) * 0.8, 1)
+    res = solve_sizing_point(ctx.profiles_df, ctx.params, 0.0, "peak_shaving", gc,
+                             scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    return _point_from_sizing(spec, res, ctx)
+
+
+def _h_pv_ssr_gc(spec, ctx):
+    """S54/S72 — LP co-chooses PV + BESS for an SSR target within a GC cap."""
+    from core.sizing_engine import solve_sizing_point
+    gc = ctx.target_gc_mw if ctx.target_gc_mw is not None \
+        else round(float(ctx.profiles_df["load_mw"].max()) * 0.8, 1)
+    res = solve_sizing_point(ctx.profiles_df, ctx.params, 0.0, "co_opt", ctx.target_ssr_pct,
+                             target_gc_mw=gc,
+                             scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    return _point_from_sizing(spec, res, ctx)
+
+
+def _h_pv_firmness(spec, ctx):
+    """S82 — LP co-chooses PV + BESS for a firmness target (DC reliability)."""
+    import dataclasses
+    from core.sizing_engine import solve_sizing_point
+    eff = ctx
+    if ctx.grid_ceiling_mw is not None:
+        eff = dataclasses.replace(
+            ctx, params=dataclasses.replace(ctx.params, site_max_grid_mw=ctx.grid_ceiling_mw))
+    res = solve_sizing_point(eff.profiles_df, eff.params, 0.0, "firmness",
+                             eff.target_firmness_pct,
+                             scenario_label=spec.id, solver_time_limit=eff.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(eff))
+    return _point_from_sizing(spec, res, eff)
+
+
+def _h_pv_offgrid_genmin(spec, ctx):
+    """S92 — minimum generation + BESS meeting firmness with no grid at all."""
+    import dataclasses
+    from core.sizing_engine import solve_sizing_point
+    p = dataclasses.replace(ctx.params, site_topology="off_grid")
+    res = solve_sizing_point(ctx.profiles_df, p, 0.0, "firmness", ctx.target_firmness_pct,
+                             scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    design = {"pv_mw": res.pv_mw, "bess_mw": res.bess_mw, "bess_mwh": res.bess_mwh,
+              "duration_h": res.bess_duration_h}
+    kpis = {KpiKeys.SSR: res.achieved_ssr_pct, KpiKeys.SCR: res.achieved_scr_pct}
+    return ScenarioResult(spec.id, spec.name, "point", spec.status, feasible=res.feasible,
+                          design=design, kpis=kpis,
+                          notes="Minimum generation for the firmness target, islanded (no grid).")
+
+
+def _h_pv_standalone_size(spec, ctx):
+    """S94 — size generation (+ optional BESS) to maximise usable export within
+    the export limit, holding curtailment ≤ target%."""
+    import dataclasses
+    from core.sizing_engine import solve_sizing_point
+    p = dataclasses.replace(ctx.params, site_topology="standalone_gen")
+    if p.export_limit_mw <= 0:
+        p = dataclasses.replace(p, export_limit_mw=50.0)
+    res = solve_sizing_point(ctx.profiles_df, p, 0.0, "export_max",
+                             ctx.target_curtailment_pct,
+                             scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                             pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    design = {"pv_mw": res.pv_mw, "bess_mw": res.bess_mw, "bess_mwh": res.bess_mwh}
+    kpis = {"Usable Export (MWh)": res.exported_mwh, "Peak Export (MW)": res.peak_export_mw}
+    return ScenarioResult(spec.id, spec.name, "point", spec.status, feasible=res.feasible,
+                          design=design, kpis=kpis,
+                          notes=f"Max annual export within {p.export_limit_mw:g} MW limit, "
+                                f"curtailment ≤ {ctx.target_curtailment_pct:g}%.")
+
+
+def _h_pv_covenant(spec, ctx):
+    """S122 — min-CAPEX PV–BESS design meeting the SSR covenant: PV-variable LP
+    at the covenant, then a costed local PV sweep to confirm the ≈CAPEX optimum."""
+    from core.sizing_engine import solve_sizing_point
+    from core.curve_runner import run_pv_bess_surface
+    from core.economic_overlay import evaluate_costs, find_optimal_point
+    from core.params import EconomicParams
+    base = solve_sizing_point(ctx.profiles_df, ctx.params, 0.0, "ssr", ctx.target_ssr_pct,
+                              scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
+                              pv_variable=True, pv_max_mw=_pv_cap(ctx))
+    if not base.feasible:
+        return _point_from_sizing(spec, base, ctx)
+    # Cost a small PV sweep around the LP's choice with real economics.
+    pv0 = base.pv_mw
+    sweep = tuple(sorted({round(pv0 * f, 1) for f in (0.8, 0.9, 1.0, 1.1, 1.2) if pv0 * f > 1}))
+    surf = run_pv_bess_surface(ctx.profiles_df, ctx.params, sweep, (ctx.target_ssr_pct,),
+                               scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
+    out = _point_from_sizing(spec, base, ctx)
+    try:
+        costed = evaluate_costs(surf, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
+        rec = find_optimal_point(costed, "capex")
+        out.table = costed
+        out.design = {"pv_mw": rec.get(CurveCols.PV_MW, pv0),
+                      "bess_mw": rec.get("Costed BESS Power (MW)", base.bess_mw),
+                      "bess_mwh": rec.get("Costed BESS Energy (MWh)", base.bess_mwh),
+                      "gc_mw": rec.get(CurveCols.PEAK_GC_MW, base.peak_grid_mw)}
+        out.notes = "Min-CAPEX design meeting the covenant (costed PV sweep around the LP optimum)."
+    except Exception as exc:
+        out.notes = f"LP covenant design (economic ranking unavailable: {exc})."
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Frontier / surface / overlay handlers (needs_minor group).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _h_frontier_gcmin(spec, ctx):
+    """S55 — GCmin frontier: pin the BESS at each swept size, ask the LP for the
+    minimum feasible grid connection at that size."""
+    from core.sizing_engine import find_gc_min
+    peak = float(ctx.profiles_df["load_mw"].max())
+    sweep = ctx.bess_sweep_mw or tuple(round(peak * f, 1) for f in (0.25, 0.5, 1.0, 2.0, 4.0))
+    rows = []
+    for b_mw in sweep:
+        b_mwh = b_mw * 4.0    # representative 4h duration per point
+        try:
+            gc = find_gc_min(ctx.profiles_df, ctx.params, ctx.pv_mw,
+                             ctx.solver_time_limit, bess_fixed_mw=b_mw, bess_fixed_mwh=b_mwh)
+            rows.append({CurveCols.BESS_MW: b_mw, CurveCols.BESS_MWH: b_mwh,
+                         CurveCols.PEAK_GC_MW: gc, CurveCols.FEASIBLE: True})
+        except Exception:
+            rows.append({CurveCols.BESS_MW: b_mw, CurveCols.BESS_MWH: b_mwh,
+                         CurveCols.PEAK_GC_MW: None, CurveCols.FEASIBLE: False})
+    df = pd.DataFrame(rows)
+    ok = df[CurveCols.FEASIBLE].any()
+    return ScenarioResult(spec.id, spec.name, "frontier", spec.status, feasible=bool(ok),
+                          table=df, notes="GCmin per BESS size (4h duration per point).")
+
+
+def _h_surface_gc(spec, ctx):
+    """S64 — PV × GC surface: min BESS per (pv, gc) cell (mirror of S62 over GC)."""
+    from core.sizing_engine import solve_sizing_point
+    from core.curve_runner import _result_to_row
+    peak = float(ctx.profiles_df["load_mw"].max())
+    pv_pts = ctx.pv_sweep_mw or (50.0, 100.0, 150.0, 200.0)
+    gc_pts = tuple(round(peak * f, 1) for f in (0.9, 0.75, 0.6, 0.45))
+    rows = []
+    for pv in pv_pts:
+        for gc in gc_pts:
+            res = solve_sizing_point(ctx.profiles_df, ctx.params, pv, "peak_shaving", gc,
+                                     scenario_label=f"{spec.id} pv={pv} gc={gc}",
+                                     solver_time_limit=ctx.solver_time_limit)
+            rows.append(_result_to_row(res, spec.name))
+    df = pd.DataFrame(rows)
+    return _curve_result(spec, ctx, df, with_overlays=False)
+
+
+def _h_sub_util_curve(spec, ctx):
+    """S35 — backup GC curve annotated with utilisation (EFC/yr, active hours)
+    under the causal rule; rows failing the utilisation floor are flagged."""
+    from core.curve_runner import run_sub_peak_shaving_curve
+    from core.rule_dispatch import run_rule_dispatch
+    df = run_sub_peak_shaving_curve(ctx.profiles_df, ctx.params,
+                                    scenario_label=spec.name,
+                                    solver_time_limit=ctx.solver_time_limit)
+    if df is None or df.empty:
+        return _curve_result(spec, ctx, df, with_overlays=False)
+    efcs, hours = [], []
+    for _, row in df.iterrows():
+        if not row.get(CurveCols.FEASIBLE) or not row.get(CurveCols.BESS_MWH):
+            efcs.append(None); hours.append(None); continue
+        try:
+            flows = run_rule_dispatch(
+                ctx.profiles_df, ctx.params, pv_mw=0.0,
+                bess_mw=float(row[CurveCols.BESS_MW]), bess_mwh=float(row[CurveCols.BESS_MWH]),
+                grid_ceiling_mw=float(row[CurveCols.TARGET_GC_MW]),
+                mode="peak_shaving", allow_grid_charge=True)
+            dis = flows["bess_to_load_mw"] if "bess_to_load_mw" in flows else None
+            if dis is None:
+                efcs.append(None); hours.append(None); continue
+            dis_mwh = float(dis.sum()) * ctx.params.dt_hours
+            efcs.append(round(dis_mwh / float(row[CurveCols.BESS_MWH]), 1))
+            hours.append(int((dis > 1e-6).sum()))
+        except Exception:
+            efcs.append(None); hours.append(None)
+    df = df.copy()
+    df["Utilisation (EFC/yr)"] = efcs
+    df["Active Hours (h/yr)"] = hours
+    floor = ctx.min_utilisation_efc
+    df["Meets Utilisation Floor"] = [
+        (e is not None and e >= floor) if floor > 0 else True for e in efcs]
+    return _curve_result(spec, ctx, df, with_overlays=False)
+
+
+def _h_overlay_site_area(spec, ctx):
+    """S101 — run the SSR curve, cost it, keep only designs that fit the site."""
+    from core.curve_runner import run_ssr_curve
+    from core.economic_overlay import evaluate_costs, check_site_area, find_optimal_point
+    from core.params import EconomicParams
+    curve = run_ssr_curve(ctx.profiles_df, ctx.params, ctx.pv_mw,
+                          scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
+    area_m2 = ctx.site_area_m2 if ctx.site_area_m2 and ctx.site_area_m2 > 0 else 1_500_000.0
+    costed = evaluate_costs(curve, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
+    checked = check_site_area(costed, area_m2)
+    fits = checked[checked.get("Fits Site", pd.Series(dtype=bool)) == True]  # noqa: E712
+    feasible = not fits.empty
+    design, kpis = {}, {}
+    if feasible:
+        best = find_optimal_point(fits, "knee")
+        design = {"pv_mw": best.get(CurveCols.PV_MW), "bess_mw": best.get("Costed BESS Power (MW)"),
+                  "bess_mwh": best.get("Costed BESS Energy (MWh)"),
+                  "gc_mw": best.get(CurveCols.PEAK_GC_MW)}
+        kpis = {KpiKeys.SSR: best.get(CurveCols.ACHIEVED_SSR_PCT),
+                "Total Area (m²)": best.get("Total Area (m²)")}
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=feasible,
+                          design=design, kpis=kpis, table=checked,
+                          notes=f"Designs filtered to fit {area_m2/10_000:.0f} ha of site area.")
+
+
+def _h_overlay_bess_cap(spec, ctx):
+    """S102 — best design under the site BESS caps; reports whether a cap binds."""
+    out = _h_point_ssr(spec, ctx)
+    d = out.design or {}
+    mw_cap, mwh_cap = ctx.params.site_max_bess_mw, ctx.params.site_max_bess_mwh
+    binds = []
+    if d.get("bess_mw") is not None and d["bess_mw"] >= mw_cap * 0.999:
+        binds.append(f"MW cap {mw_cap:g}")
+    if d.get("bess_mwh") is not None and d["bess_mwh"] >= mwh_cap * 0.999:
+        binds.append(f"MWh cap {mwh_cap:g}")
+    out.notes = ("BESS cap BINDS: " + ", ".join(binds)) if binds else \
+        f"BESS caps ({mw_cap:g} MW / {mwh_cap:g} MWh) not binding."
+    return out
+
+
+def _h_overlay_import_only(spec, ctx):
+    """S104 — strict import-only BTM: export forced to zero, then the base solve."""
+    import dataclasses
+    eff = dataclasses.replace(ctx, params=dataclasses.replace(ctx.params, export_limit_mw=0.0))
+    out = _h_point_ssr(spec, eff)
+    out.notes = (out.notes + " Export hard-capped at 0 (import-only policy).").strip()
+    return out
+
+
+def _h_overlay_export_limited(spec, ctx):
+    """S105 — hybrid BTM with a bounded export route."""
+    import dataclasses
+    limit = ctx.params.export_limit_mw if ctx.params.export_limit_mw > 0 else 20.0
+    eff = dataclasses.replace(ctx, params=dataclasses.replace(ctx.params, export_limit_mw=limit))
+    out = _h_point_ssr(spec, eff)
+    out.notes = (out.notes + f" Export allowed up to {limit:g} MW.").strip()
+    return out
+
+
+def _h_overlay_dayone(spec, ctx):
+    """S111 — day-one sizing: the same deliverable solve with no EoL gross-up."""
+    import dataclasses
+    eff = dataclasses.replace(
+        ctx, params=dataclasses.replace(ctx.params, eol_capacity_retention_pct=100.0))
+    out = _h_deliverable(spec, eff)
+    out.notes = "Day-one lens: EoL retention 100% (size meets the target in year 1 only)."
+    return out
+
+
+def _point_series_for_overlay(ctx) -> "pd.Series":
+    """Solve the base SSR point and shape it as the CurveCols Series the Phase-2
+    analyses consume."""
+    from core.sizing_engine import solve_sizing_point
+    from core.curve_runner import _result_to_row
+    res = solve_sizing_point(ctx.profiles_df, ctx.params, ctx.pv_mw, "ssr",
+                             ctx.target_ssr_pct, solver_time_limit=ctx.solver_time_limit)
+    row = _result_to_row(res, "overlay-base")
+    row["Costed BESS Power (MW)"] = res.bess_mw
+    row["Costed BESS Energy (MWh)"] = res.bess_mwh
+    return pd.Series(row)
+
+
+def _h_overlay_seasonal(spec, ctx):
+    """S113 — value of charging from grid headroom windows (analytic overlay)."""
+    from core.economic_overlay import analyse_seasonal_shifting
+    from core.params import EconomicParams
+    base = _point_series_for_overlay(ctx)
+    monthly = analyse_seasonal_shifting(ctx.profiles_df, base, EconomicParams(),
+                                        ctx.params.dt_hours)
+    feasible = monthly is not None and not monthly.empty
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=feasible,
+                          design={k: base.get(k) for k in (CurveCols.PV_MW, CurveCols.BESS_MW,
+                                                           CurveCols.BESS_MWH)},
+                          table=monthly,
+                          notes="Monthly grid-headroom windows and estimated shifting value.")
+
+
+def _h_overlay_grid_services(spec, ctx):
+    """S114 — revenue vs BTM impact of reserving SOC for grid services."""
+    from core.economic_overlay import analyse_grid_services
+    from core.params import EconomicParams
+    base = _point_series_for_overlay(ctx)
+    gs = analyse_grid_services(base, EconomicParams())
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=bool(gs),
+                          design={k: base.get(k) for k in (CurveCols.PV_MW, CurveCols.BESS_MW,
+                                                           CurveCols.BESS_MWH)},
+                          kpis={str(k): v for k, v in (gs or {}).items()
+                                if isinstance(v, (int, float))},
+                          notes="Analytic grid-services estimate with reserved SOC.")
+
+
+def _h_overlay_econ_rank(spec, ctx):
+    """S121 — techno-economic ranking of the SSR curve (knee/LCOE/NPV)."""
+    from core.curve_runner import run_ssr_curve
+    from core.economic_overlay import evaluate_costs, find_optimal_point
+    from core.params import EconomicParams
+    curve = run_ssr_curve(ctx.profiles_df, ctx.params, ctx.pv_mw,
+                          scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
+    costed = evaluate_costs(curve, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
+    rec = find_optimal_point(costed, "knee")
+    design = {"pv_mw": rec.get(CurveCols.PV_MW), "bess_mw": rec.get("Costed BESS Power (MW)"),
+              "bess_mwh": rec.get("Costed BESS Energy (MWh)"), "gc_mw": rec.get(CurveCols.PEAK_GC_MW)}
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=True,
+                          design=design, table=costed,
+                          notes="Knee-of-curve commercial optimum (default economics; "
+                                "run /run with_economics for custom costs).")
+
+
+def _h_overlay_reinforce(spec, ctx):
+    """S123 — reinforcement vs BESS: cost each point of the GCmin frontier."""
+    from core.params import EconomicParams
+    front = _h_frontier_gcmin(spec, ctx)
+    if front.table is None or front.table.empty:
+        return front
+    eco = EconomicParams()
+    df = front.table.copy()
+    df["BESS CAPEX (€M)"] = (df[CurveCols.BESS_MW] * eco.cost_bess_mw
+                             + df[CurveCols.BESS_MWH] * eco.cost_bess_mwh) / 1e6
+    df["Grid CAPEX (€M)"] = df[CurveCols.PEAK_GC_MW] * eco.grid_connection_cost_mw / 1e6
+    df["Total CAPEX (€M)"] = df["BESS CAPEX (€M)"] + df["Grid CAPEX (€M)"]
+    ok = df[df[CurveCols.FEASIBLE] == True]  # noqa: E712
+    best = ok.loc[ok["Total CAPEX (€M)"].idxmin()] if not ok.empty else None
+    design = {} if best is None else {
+        "bess_mw": best[CurveCols.BESS_MW], "bess_mwh": best[CurveCols.BESS_MWH],
+        "gc_mw": best[CurveCols.PEAK_GC_MW]}
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status,
+                          feasible=best is not None, design=design, table=df,
+                          notes="Cheapest battery-vs-connection trade-off along the frontier.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Consumer-layer handlers — the consumer demand is the context load series
+# (the app aggregates multi-consumer loads upstream and scales the real shape).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _h_port_event_bess(spec, ctx):
+    """S83 — BESS covering port/vessel demand events within the connection cap."""
+    out = _h_point_gc(spec, ctx)
+    out.notes = (out.notes + " Consumer load = context demand series "
+                 "(vessel events are its peaks).").strip()
+    return out
+
+
+def _h_port_precharge(spec, ctx):
+    """S84 — pre-charged BESS under a GC limit: grid-charging explicitly on so
+    the battery fills ahead of demand events."""
+    import dataclasses
+    eff = dataclasses.replace(
+        ctx, params=dataclasses.replace(ctx.params, allow_grid_charge=True))
+    out = _h_point_gc(spec, eff)
+    out.notes = (out.notes + " Grid-charging ON (pre-charge ahead of events).").strip()
+    return out
+
+
+def _h_port_reinforce(spec, ctx):
+    """S85 — avoid reinforcing the existing connection: size the battery that
+    holds today's cap, and report it against the reinforcement alternative."""
+    from core.params import EconomicParams
+    out = _h_point_gc(spec, ctx)
+    d = out.design or {}
+    if out.feasible and d.get("bess_mw") is not None:
+        eco = EconomicParams()
+        bess_capex = (d["bess_mw"] * eco.cost_bess_mw + d["bess_mwh"] * eco.cost_bess_mwh) / 1e6
+        peak = float(ctx.profiles_df["load_mw"].max())
+        cap = ctx.target_gc_mw if ctx.target_gc_mw is not None else round(peak * 0.8, 1)
+        reinf_capex = max(0.0, peak - cap) * eco.grid_connection_cost_mw / 1e6
+        out.kpis["BESS CAPEX (€M)"] = round(bess_capex, 2)
+        out.kpis["Reinforcement CAPEX (€M)"] = round(reinf_capex, 2)
+        out.notes = ("Battery avoids reinforcing beyond the existing connection; "
+                     "compare the two CAPEX figures.")
+    return out
+
+
+def _h_multi_consumer(spec, ctx):
+    """S86 — shared PV+BESS for the aggregated multi-consumer demand."""
+    out = _h_pv_ssr(spec, ctx)
+    out.notes = (out.notes + " Demand = aggregated consumer loads.").strip()
+    return out
+
+
+def _h_dc_port_coloc(spec, ctx):
+    """S87 — DC + port colocation: shared design for the combined load under an
+    SSR target and grid cap."""
+    out = _h_pv_ssr_gc(spec, ctx)
+    out.notes = (out.notes + " Demand = DC + port combined load.").strip()
+    return out
+
+
 _HANDLERS: dict[str, Callable[[ScenarioSpec, ScenarioContext], ScenarioResult]] = {
     "point_ssr":     _h_point_ssr,
     "point_gc":      _h_point_gc,
