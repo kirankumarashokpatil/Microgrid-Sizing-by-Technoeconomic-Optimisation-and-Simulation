@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import tempfile
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -58,6 +60,7 @@ from core.economic_overlay import (                          # noqa: E402
 )
 from core.resolver import resolve_scenario                   # noqa: E402
 from core.site import parcel_capacity, area_for_capacity, _SOLAR_MW_PER_HA  # noqa: E402
+from core.sweep import solve_ssr_point, solve_ssr_point_star  # noqa: E402
 from core.boundary import parse_boundary                      # noqa: E402
 from core.schema import CurveCols, KpiKeys                   # noqa: E402
 from core.scenarios import (                                 # noqa: E402
@@ -1056,42 +1059,41 @@ def optimise_split(req: OptimiseSplitRequest) -> dict:
     except Exception:
         pv_floor = 0.0
 
-    frontier = []
-    for pv in pv_points:
-        if pv + 1e-6 < pv_floor:      # cannot reach target on energy grounds — skip
-            continue
-        try:
-            out = run(RunRequest(
-                scenario_id="S11_BTM_SSR_TARGET_BESS", profile_path=req.profile_path,
-                load_peak_mw=req.load_peak_mw, pv_mw=pv, wind_mw=req.wind_mw,
-                target_ssr_pct=req.target_ssr_pct, site_topology=req.site_topology,
-            ))
-        except Exception:
-            continue
-        if not out.get("feasible"):
-            continue
-        d = out.get("design") or {}
-        k = out.get("kpis") or {}
-        bess_mw = d.get("bess_mw", 0.0) or 0.0
-        bess_mwh = d.get("bess_mwh", 0.0) or 0.0
-        grid_mw = k.get("GCmin Peak (MW)", d.get("gc_mw", 0.0)) or 0.0
-        grid_import = k.get("Total Grid Import (MWh)", 0.0) or 0.0
+    # Each PV point is an independent full-year LP. The appsi/HiGHS solver is
+    # in-process and NOT thread-safe, so fan the points out across PROCESSES.
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    todo = [pv for pv in pv_points if pv + 1e-6 >= pv_floor]   # prune infeasible-by-energy
+    args = [(path, req.load_peak_mw, pv, req.wind_mw, req.target_ssr_pct, req.site_topology)
+            for pv in todo]
 
+    results: list[dict] = []
+    if args:
+        try:
+            workers = max(1, min(len(args), os.cpu_count() or 2))
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(solve_ssr_point_star, args))
+        except Exception:
+            results = [solve_ssr_point(*a) for a in args]   # fallback: sequential, never break
+
+    def _cost_row(r: dict) -> dict:
+        pv = r["pv_mw"]; bess_mw = r["bess_mw"]; bess_mwh = r["bess_mwh"]
+        grid_mw = r["grid_mw"]; grid_import = r["grid_import_mwh"]
         capex = (pv * req.cost_pv_mw + req.wind_mw * req.cost_wind_mw
                  + bess_mw * req.cost_bess_mw + bess_mwh * req.cost_bess_mwh
                  + grid_mw * req.grid_connection_cost_mw)
         annual = grid_import * req.grid_cost_mwh + bess_mwh * req.fixed_opex_per_mwh_year
         lifetime = capex + req.project_lifespan_years * annual
-
-        frontier.append({
+        return {
             "pv_mw": pv, "wind_mw": req.wind_mw,
             "pv_land_ha": round(pv / _SOLAR_MW_PER_HA, 1) if _SOLAR_MW_PER_HA else None,
             "bess_mw": round(bess_mw, 1), "bess_mwh": round(bess_mwh, 1),
-            "grid_mw": round(grid_mw, 2), "ssr_pct": k.get("SSR (%)"),
+            "grid_mw": round(grid_mw, 2), "ssr_pct": round(r["ssr_pct"], 1),
             "capex_m": round(capex / 1e6, 2),
             "lifetime_cost_m": round(lifetime / 1e6, 2),
-        })
+        }
 
+    frontier = sorted((_cost_row(r) for r in results if r and r.get("feasible")),
+                      key=lambda x: x["pv_mw"])
     best = min(frontier, key=lambda r: r["lifetime_cost_m"]) if frontier else None
     return {
         "inputs": {
