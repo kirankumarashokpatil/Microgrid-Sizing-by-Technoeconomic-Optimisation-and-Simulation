@@ -166,6 +166,12 @@ def solve_sizing_point(
         if total_pv_avail_mwh > 1e-9 else 0.0
     )
 
+    total_curtail_mwh = sum(max(0.0, pyo.value(model.p_curt[t])) for t in model.T) * dt
+    achieved_osr = (
+        total_curtail_mwh / total_pv_avail_mwh * 100.0
+        if total_pv_avail_mwh > 1e-9 else 0.0
+    )
+
     return SizingResult(
         scenario_name=scenario_label,
         pv_mw=round(realized_pv, 4),
@@ -177,6 +183,8 @@ def solve_sizing_point(
         target_gc_mw=target_gc_mw,
         achieved_ssr_pct=round(achieved_ssr, 2),
         achieved_scr_pct=round(achieved_scr, 2),
+        achieved_osr_pct=round(achieved_osr, 2),
+        total_curtailed_mwh=round(total_curtail_mwh, 1),
         bess_duration_h=round(duration, 2),
         exported_mwh=round(total_export_mwh, 4),
         peak_export_mw=round(peak_export, 4),

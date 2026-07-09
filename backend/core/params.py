@@ -112,6 +112,8 @@ class SizingResult:
     # Achieved physical KPIs (read back from LP after solve)
     achieved_ssr_pct: float  = 0.0
     achieved_scr_pct: float  = 0.0   # self-consumption ratio: PV used / PV available
+    achieved_osr_pct: float  = 0.0   # over-supply ratio / curtailment %
+    total_curtailed_mwh: float = 0.0
     bess_duration_h: float   = 0.0   # = bess_mwh / bess_mw (or 0 if bess_mw=0)
     exported_mwh: float      = 0.0
     peak_export_mw: float    = 0.0

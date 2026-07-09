@@ -104,6 +104,7 @@ def solve_ssr_point(path: str, load_peak_mw, pv_mw: float, wind_mw: float,
                 "op_ssr_pct":        float(op_kpis[KpiKeys.SSR]),
                 "op_scr_pct":        float(op_kpis[KpiKeys.SCR]),
                 "op_curtailment_pct": float(op_kpis[KpiKeys.OSR]),
+                "op_curtailed_mwh":  float(op_kpis[KpiKeys.TOTAL_CURTAILMENT]),
                 "op_gc_mw":          float(op_kpis[KpiKeys.GCMIN_PEAK]),
                 "op_unmet_mwh":      float(op_kpis[KpiKeys.TOTAL_UNMET_LOAD]),
             })

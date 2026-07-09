@@ -52,6 +52,7 @@ class KpiKeys:
     TOTAL_GRID_IMPORT = "Total Grid Import (MWh)"
     TOTAL_GRID_EXPORT = "Total Grid Export (MWh)"
     TOTAL_UNMET_LOAD  = "Total Unmet Load (MWh)"
+    TOTAL_CURTAILMENT = "Total Curtailed (MWh)"
     SERVED_LOAD       = "Served Load (MWh)"
     RELIABILITY       = "Reliability (%)"
 
@@ -81,7 +82,9 @@ class CurveCols:
     PEAK_EXPORT_MW   = "Achieved Peak Grid Export (MW)"
     ACHIEVED_SSR_PCT = "Achieved SSR (%)"
     ACHIEVED_SCR_PCT = "Achieved SCR (%)"
+    ACHIEVED_OSR_PCT = "Achieved OSR / Curtailment (%)"
     EXPORTED_MWH     = "Total Exported (MWh)"
+    CURTAILED_MWH    = "LP Curtailed (MWh)"
     FEASIBLE         = "Feasible"
 
     # Operational verification under the causal rule (Model R). The columns above
@@ -89,8 +92,10 @@ class CurveCols:
     # auditable controller actually achieves, plus the gap between them.
     OP_SSR_PCT       = "Operational SSR (%)"
     OP_SCR_PCT       = "Operational SCR (%)"
+    OP_OSR_PCT       = "Operational OSR / Curtailment (%)"
     OP_PEAK_GC_MW    = "Operational Peak Grid (MW)"
     OP_GRID_MWH      = "Operational Grid Import (MWh)"
+    OP_CURTAILED_MWH = "Operational Curtailed (MWh)"
     OP_UNMET_MWH     = "Operational Unmet (MWh)"
     OP_SSR_GAP_PP    = "SSR Gap O−R (pp)"
 
@@ -179,6 +184,7 @@ class FlowCols:
     CURTAIL_MW  = "curtailed_mw"     # generation spilled
     UNMET_MW    = "unmet_mw"         # load shed (not served)
     EXPORT_MW   = "export_mw"        # export to grid (0 for BTM import-only)
+    DISPATCH_REASON = "dispatch_reason"  # human-readable annotation of why each action was taken
 
 
 FLOW_REQUIRED_COLUMNS = (

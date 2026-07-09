@@ -465,7 +465,9 @@ def _curve_columns() -> list[str]:
         CurveCols.PEAK_EXPORT_MW,
         CurveCols.ACHIEVED_SSR_PCT,
         CurveCols.ACHIEVED_SCR_PCT,
+        CurveCols.ACHIEVED_OSR_PCT,
         CurveCols.EXPORTED_MWH,
+        CurveCols.CURTAILED_MWH,
         CurveCols.FEASIBLE,
     ]
 
@@ -484,6 +486,8 @@ def _result_to_row(result: SizingResult, scenario_label: str) -> dict:
         CurveCols.PEAK_EXPORT_MW:   result.peak_export_mw if result.feasible else None,
         CurveCols.ACHIEVED_SSR_PCT: result.achieved_ssr_pct if result.feasible else None,
         CurveCols.ACHIEVED_SCR_PCT: result.achieved_scr_pct if result.feasible else None,
+        CurveCols.ACHIEVED_OSR_PCT: result.achieved_osr_pct if result.feasible else None,
         CurveCols.EXPORTED_MWH:     result.exported_mwh if result.feasible else None,
+        CurveCols.CURTAILED_MWH:    result.total_curtailed_mwh if result.feasible else None,
         CurveCols.FEASIBLE:         result.feasible,
     }

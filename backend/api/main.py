@@ -147,6 +147,7 @@ class RunRequest(BaseModel):
     bess_mwh: float = 0.0
     grid_ceiling_mw: Optional[float] = None
     deliverable_target: str = "ssr"        # "ssr" | "gc"
+    sizing_basis: str = "lp"               # "lp" | "deliverable" | "eol"
     pv_sweep_mw: list[float] = Field(default_factory=list)
     ssr_targets_pct: list[float] = Field(default_factory=list)
     solver_time_limit: int = 120
@@ -686,6 +687,7 @@ def run(req: RunRequest) -> dict:
         bess_mwh=req.bess_mwh,
         grid_ceiling_mw=req.grid_ceiling_mw,
         deliverable_target=req.deliverable_target,
+        sizing_basis=req.sizing_basis,
         pv_sweep_mw=tuple(req.pv_sweep_mw),
         ssr_targets_pct=tuple(req.ssr_targets_pct),
         solver_time_limit=req.solver_time_limit,

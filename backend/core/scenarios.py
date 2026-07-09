@@ -98,6 +98,11 @@ class ScenarioContext:
     # S42 deliverable sizing: which target to hit ("ssr" or "gc"). Explicit so the
     # result never depends on whether an unrelated context field is populated.
     deliverable_target: str = "ssr"
+    # Sizing basis: "lp" (default LP lower-bound), "deliverable" (causal-rule
+    # bisection — the battery you actually build), or "eol" (deliverable +
+    # end-of-life gross-up — the day-one install that still meets the target
+    # at year ~20). Any point handler honours this override.
+    sizing_basis: str = "lp"
     # for sweeps:
     pv_sweep_mw: tuple = ()
     ssr_targets_pct: tuple = ()
@@ -117,6 +122,7 @@ class ScenarioResult:
     kpis: dict = field(default_factory=dict)      # SSR, SCR, GCmin, unmet, …
     table: Optional[pd.DataFrame] = None          # curve / surface / frontier
     flows: Optional[pd.DataFrame] = None          # timestep FlowsFrame (forward eval)
+    point_flows: dict = field(default_factory=dict) # per-point flows for curves/sweeps
     notes: str = ""
 
     def summary(self) -> str:
@@ -141,7 +147,8 @@ class ScenarioResult:
         if self.kpis:
             k = self.kpis
             kbits = []
-            for label, key in (("SSR", KpiKeys.SSR), ("SCR", KpiKeys.SCR),
+            for label, key in (("SSR", KpiKeys.SSR), ("SCR", KpiKeys.SCR), ("OSR", KpiKeys.OSR),
+                               ("curtail", KpiKeys.TOTAL_CURTAILMENT),
                                ("peak", KpiKeys.GCMIN_PEAK), ("unmet", KpiKeys.TOTAL_UNMET_LOAD)):
                 if key in k:
                     unit = "%" if "%" in key else (" MWh" if "MWh" in key else " MW")
@@ -174,6 +181,8 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
     kpis = {
         KpiKeys.SSR: res.achieved_ssr_pct,
         KpiKeys.SCR: res.achieved_scr_pct,
+        KpiKeys.OSR: res.achieved_osr_pct,
+        KpiKeys.TOTAL_CURTAILMENT: res.total_curtailed_mwh,
         KpiKeys.GCMIN_PEAK: res.peak_grid_mw,
     }
     notes = ""
@@ -196,6 +205,8 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
             kpis[KpiKeys.SSR] = opk[KpiKeys.SSR]           # Model R is the truth
             kpis[KpiKeys.SCR] = opk[KpiKeys.SCR]
             kpis[KpiKeys.OSR] = opk[KpiKeys.OSR]           # curtailment, for parity with forward-eval rows
+            if KpiKeys.TOTAL_CURTAILMENT in opk:
+                kpis[KpiKeys.TOTAL_CURTAILMENT] = opk[KpiKeys.TOTAL_CURTAILMENT]
             kpis[KpiKeys.GCMIN_PEAK] = opk[KpiKeys.GCMIN_PEAK]
             kpis[KpiKeys.TOTAL_UNMET_LOAD] = opk[KpiKeys.TOTAL_UNMET_LOAD]
             notes = "KPIs are operational (Model R); LP is the lower bound."
@@ -207,12 +218,59 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
                           flows=flows, notes=notes)
 
 
+def _apply_sizing_basis(spec, ctx, lp_result, *, target_type, target_value):
+    """Re-size an LP point result according to ctx.sizing_basis.
+
+    "lp"          → return the LP result unchanged (default).
+    "deliverable" → bisect under the causal rule to find the minimum BESS
+                    that actually meets the target when operated.
+    "eol"         → deliverable + EoL gross-up (day-one install that still
+                    meets the target at year ~20).
+
+    Returns a ScenarioResult with the appropriate design and notes.
+    """
+    basis = getattr(ctx, "sizing_basis", "lp") or "lp"
+    if basis == "lp":
+        return _point_from_sizing(spec, lp_result, ctx)
+
+    # Deliverable or EoL — run causal bisection.
+    from core.rule_dispatch import size_by_bisection
+    bis_type = "peak_shaving" if target_type == "peak_shaving" else "ssr"
+    res = size_by_bisection(ctx.profiles_df, ctx.params, pv_mw=ctx.pv_mw,
+                            target_type=bis_type, target_value=target_value)
+
+    retention = ctx.params.eol_retention_fraction
+    design = {
+        "pv_mw": ctx.pv_mw,
+        "bess_mw": res.bess_mw,
+        "bess_mwh": res.bess_mwh,
+        "gc_mw": res.kpis.get("GCmin Peak (MW)", lp_result.peak_grid_mw),
+        "duration_h": round(res.bess_mwh / res.bess_mw, 2) if res.bess_mw > 0 else 0.0,
+    }
+
+    if basis == "eol":
+        raw_mw  = res.bess_mw  / retention
+        raw_mwh = res.bess_mwh / retention
+        design["bess_mw"]  = round(min(raw_mw,  ctx.params.site_max_bess_mw), 2)
+        design["bess_mwh"] = round(min(raw_mwh, ctx.params.site_max_bess_mwh), 2)
+        design["bess_mwh_eol"] = round(res.bess_mwh, 2)  # usable at EoL
+        notes = (f"EoL-honest sizing (retention {retention:.0%}): "
+                 f"day-one install meets the target at year ~20.")
+    else:
+        notes = "Deliverable size meets the target under the causal rule."
+
+    return ScenarioResult(spec.id, spec.name, "point", spec.status,
+                          feasible=res.feasible, design=design, kpis=res.kpis,
+                          notes=notes)
+
+
 def _h_point_ssr(spec, ctx):
     from core.sizing_engine import solve_sizing_point
     res = solve_sizing_point(ctx.profiles_df, ctx.params, ctx.pv_mw,
                              "ssr", ctx.target_ssr_pct,
                              scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit)
-    return _point_from_sizing(spec, res, ctx)
+    return _apply_sizing_basis(spec, ctx, res,
+                               target_type="ssr", target_value=ctx.target_ssr_pct)
 
 
 def _h_point_gc(spec, ctx):
@@ -221,7 +279,8 @@ def _h_point_gc(spec, ctx):
     res = solve_sizing_point(ctx.profiles_df, ctx.params, ctx.pv_mw,
                              "peak_shaving", gc,
                              scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit)
-    return _point_from_sizing(spec, res, ctx)
+    return _apply_sizing_basis(spec, ctx, res,
+                               target_type="peak_shaving", target_value=gc)
 
 
 def _h_point_firmness(spec, ctx):
@@ -242,15 +301,16 @@ def _h_point_firmness(spec, ctx):
 def _curve_result(spec, ctx, curve_df, *, with_overlays=True):
     """Attach Model R overlays (operational + deliverable + EoL) to a curve and
     wrap it in a ScenarioResult."""
+    point_flows = {}
     if with_overlays and ctx.params.site_topology == "grid_connected_btm" \
             and curve_df is not None and not curve_df.empty:
         from core.rule_dispatch import attach_operational_kpis, attach_rule_sizing
-        curve_df = attach_operational_kpis(curve_df, ctx.profiles_df, ctx.params)
+        curve_df, point_flows = attach_operational_kpis(curve_df, ctx.profiles_df, ctx.params, return_flows=True)
         curve_df = attach_rule_sizing(curve_df, ctx.profiles_df, ctx.params)
     feasible = bool(curve_df is not None and not curve_df.empty
                     and curve_df.get(CurveCols.FEASIBLE, pd.Series([False])).any())
     return ScenarioResult(spec.id, spec.name, spec.answer_mode, spec.status,
-                          feasible=feasible, table=curve_df)
+                          feasible=feasible, table=curve_df, point_flows=point_flows)
 
 
 def _h_curve_ssr(spec, ctx):

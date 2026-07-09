@@ -24,6 +24,7 @@ This module is the single source of truth for operational SSR/SCR/GCmin:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Union, Optional
 
 import numpy as np
 import pandas as pd
@@ -134,6 +135,7 @@ def run_rule_dispatch(
     soc_out   = np.zeros(n)
     curtail   = np.zeros(n)
     unmet     = np.zeros(n)
+    reasons   = [None] * n        # per-timestep dispatch annotations
 
     def _max_charge(soc_now, already):
         """Charge power headroom (MW) given SOC and power already committed."""
@@ -192,6 +194,60 @@ def run_rule_dispatch(
         unmet[t]     = residual      # load left unserved after all sources
         soc_out[t]   = soc
 
+        # ── Build human-readable reason for this timestep ────────────────
+        parts = []
+        load_t = load_arr[t]
+        pv_t   = pv_arr[t]
+
+        # Dominant supply narrative
+        if load_t < 1e-6:
+            parts.append("No load")
+            if c_gen > 1e-6:
+                parts.append(f"surplus PV charging battery ({c_gen:.1f} MW)")
+            elif surplus > 1e-6:
+                parts.append(f"PV curtailed ({surplus:.1f} MW, battery full)")
+        else:
+            # What served the load?
+            if pv_to_load > 1e-6 and pv_to_load >= load_t - 1e-6:
+                parts.append(f"PV fully covers load ({pv_to_load:.1f}/{load_t:.1f} MW)")
+            elif pv_to_load > 1e-6:
+                parts.append(f"PV partially covers load ({pv_to_load:.1f}/{load_t:.1f} MW)")
+                shortfall = load_t - pv_to_load
+                if d > 1e-6 and g_used > 1e-6:
+                    parts.append(f"shortfall {shortfall:.1f} MW met by battery ({d:.1f} MW) + grid ({g_used:.1f} MW)")
+                elif d > 1e-6:
+                    parts.append(f"shortfall {shortfall:.1f} MW met by battery discharge ({d:.1f} MW)")
+                elif g_used > 1e-6:
+                    parts.append(f"shortfall {shortfall:.1f} MW met by grid import ({g_used:.1f} MW)")
+            elif pv_t < 1e-6:
+                parts.append(f"No PV generation")
+                if d > 1e-6 and g_used > 1e-6:
+                    parts.append(f"load {load_t:.1f} MW served by battery ({d:.1f} MW) + grid ({g_used:.1f} MW)")
+                elif d > 1e-6:
+                    parts.append(f"load {load_t:.1f} MW served by battery discharge ({d:.1f} MW)")
+                elif g_used > 1e-6:
+                    parts.append(f"load {load_t:.1f} MW served entirely by grid ({g_used:.1f} MW)")
+
+            # Charging narrative
+            if c_gen > 1e-6:
+                parts.append(f"excess PV charging battery ({c_gen:.1f} MW)")
+
+            # Grid charging narrative
+            if c_grid > 1e-6:
+                parts.append(f"grid valley-fill charging battery ({c_grid:.1f} MW)")
+
+            # Curtailment / unmet
+            if surplus > 1e-6:
+                parts.append(f"PV curtailed ({surplus:.1f} MW, battery full/at power limit)")
+            if residual > 1e-6:
+                parts.append(f"UNMET load ({residual:.1f} MW, grid ceiling binding)")
+
+        # SOC context
+        soc_pct = soc / bess_mwh * 100.0 if bess_mwh > 0 else 0.0
+        parts.append(f"SOC {soc_pct:.0f}%")
+
+        reasons[t] = "; ".join(parts)
+
     return pd.DataFrame({
         FlowCols.TIMESTAMP:    profiles_df[FlowCols.TIMESTAMP].to_numpy(),
         FlowCols.LOAD_MW:      load_arr,
@@ -204,6 +260,7 @@ def run_rule_dispatch(
         FlowCols.CURTAIL_MW:   curtail,
         FlowCols.UNMET_MW:     unmet,
         FlowCols.EXPORT_MW:    np.zeros(n),   # BTM import-only: never exports
+        FlowCols.DISPATCH_REASON: reasons,
     })
 
 
@@ -242,6 +299,7 @@ def compute_flow_kpis(flows: pd.DataFrame, dt_hours: float) -> dict:
         KpiKeys.TOTAL_DEMAND:      round(total_demand, 1),
         KpiKeys.TOTAL_GRID_IMPORT: round(total_grid, 1),
         KpiKeys.TOTAL_UNMET_LOAD:  round(total_unmet, 1),
+        KpiKeys.TOTAL_CURTAILMENT: round(total_curtail, 1),
         KpiKeys.SERVED_LOAD:       round(served_load, 1),
         KpiKeys.RELIABILITY:       round(reliability, 2),
     }
@@ -537,7 +595,9 @@ def attach_operational_kpis(
     curve_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
     params: PhysicalParams,
-) -> pd.DataFrame:
+    *,
+    return_flows: bool = False,
+) -> Union[pd.DataFrame, tuple[pd.DataFrame, dict[str, pd.DataFrame]]]:
     """
     For every feasible row of a Phase-1 sizing curve (Model O / LP), re-run the
     design under the causal rule (Model R) and attach the operational KPIs plus
@@ -550,17 +610,20 @@ def attach_operational_kpis(
     (LP columns only) rather than given misleading operational numbers.
     """
     if curve_df is None or curve_df.empty:
-        return curve_df
+        return (curve_df, {}) if return_flows else curve_df
     if getattr(params, "site_topology", "grid_connected_btm") != "grid_connected_btm":
-        return curve_df
+        return (curve_df, {}) if return_flows else curve_df
 
     op_ssr, op_scr, op_peak, op_grid, op_unmet, op_gap = [], [], [], [], [], []
+    op_curtail, op_osr = [], []
+    point_flows = {}
     for _, row in curve_df.iterrows():
         feasible = bool(row.get(CurveCols.FEASIBLE, False))
         bess_mwh = row.get(CurveCols.BESS_MWH, None)
         if not feasible or bess_mwh is None or pd.isna(bess_mwh):
             op_ssr.append(None); op_scr.append(None); op_peak.append(None)
             op_grid.append(None); op_unmet.append(None); op_gap.append(None)
+            op_curtail.append(None); op_osr.append(None)
             continue
 
         target_type = row.get(CurveCols.TARGET_TYPE, "ssr")
@@ -574,7 +637,7 @@ def attach_operational_kpis(
         else:
             ceiling = params.site_max_grid_mw
 
-        kpis, _ = verify_sizing_with_rule(
+        kpis, flows = verify_sizing_with_rule(
             profiles_df, params,
             pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=float(bess_mwh),
             target_type=target_type, grid_ceiling_mw=ceiling,
@@ -585,15 +648,35 @@ def attach_operational_kpis(
         op_peak.append(kpis[KpiKeys.GCMIN_PEAK])
         op_grid.append(kpis[KpiKeys.TOTAL_GRID_IMPORT])
         op_unmet.append(kpis[KpiKeys.TOTAL_UNMET_LOAD])
+        op_curtail.append(kpis[KpiKeys.TOTAL_CURTAILMENT])
+        op_osr.append(kpis[KpiKeys.OSR])
         op_gap.append(round(lp_ssr - kpis[KpiKeys.SSR], 2))
+
+        base_name = "Sim_NoBESS" if float(bess_mwh) < 1e-6 else (
+            f"SSR_{int(round(float(row[CurveCols.TARGET_SSR_PCT])))}pct" if target_type == "ssr" and pd.notna(row.get(CurveCols.TARGET_SSR_PCT))
+            else (f"GC_{int(round(float(row[CurveCols.TARGET_GC_MW] or row[CurveCols.PEAK_GC_MW])))}MW" if _mode_for(target_type) == "peak_shaving"
+                  else f"P_{len(point_flows)+1}")
+        )
+        if base_name == "Sim_NoBESS" and base_name in point_flows:
+            continue
+        sheet_name = base_name
+        idx = 2
+        while sheet_name in point_flows:
+            sheet_name = f"{base_name}_{idx}"
+            idx += 1
+        point_flows[sheet_name] = flows
 
     out = curve_df.copy()
     out[CurveCols.OP_SSR_PCT]    = op_ssr
     out[CurveCols.OP_SCR_PCT]    = op_scr
+    out[CurveCols.OP_OSR_PCT]    = op_osr
     out[CurveCols.OP_PEAK_GC_MW] = op_peak
     out[CurveCols.OP_GRID_MWH]   = op_grid
+    out[CurveCols.OP_CURTAILED_MWH] = op_curtail
     out[CurveCols.OP_UNMET_MWH]  = op_unmet
     out[CurveCols.OP_SSR_GAP_PP] = op_gap
+    if return_flows:
+        return out, point_flows
     return out
 
 
