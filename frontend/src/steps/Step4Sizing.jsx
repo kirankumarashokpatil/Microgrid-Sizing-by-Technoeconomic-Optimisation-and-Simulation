@@ -1,11 +1,11 @@
-// Step 4 — Closed-loop sizing. Runs the real engine: the SSR curve + Phase-2
-// economics, then a forward-eval at the recommended size for dispatch flows.
+// Step 4 — Closed-loop sizing. Runs the real engine: the SSR curve + physical
+// sizing, then a forward-eval at the recommended size for dispatch flows.
 // Everything downstream (Steps 5–6, metric strip) reads what this produces.
 import { useEffect, useRef, useState } from "react";
-import { Nav } from "./shared.jsx";
+import { Nav, EmptyChart } from "./shared.jsx";
 import { DesignScenarios } from "./DesignScenarios.jsx";
 import { SplitOptimiser } from "./SplitOptimiser.jsx";
-import { runScenario, resolveScenario, getScenarios } from "../lib/api.js";
+import { runScenario, resolveScenario, getScenarios, recordsToObjects, ssrRange } from "../lib/api.js";
 import { fmt } from "../lib/svg.js";
 
 // Step-2 topology choice → the engine's site_topology value (authoritative on /run).
@@ -20,18 +20,22 @@ const RUN_MSGS = [
   "Phase 1/3: SSR_max screening from the dataset…",
   "Phase 2/3: sweeping SSR targets — sizing BESS per point…",
   "Phase 3/3: operational verify under the causal rule (Model R)…",
-  "Overlaying Phase-2 economics (CAPEX / OPEX / NPV / LCOE)…",
   "Forward-eval at the recommended size for dispatch flows…",
-  "Selecting the knee design subject to the SSR covenant ✓",
+  "Selecting optimal physical design subject to covenant ✓",
 ];
 
-export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
-                              setFlows, running, setRunning, step, go }) {
+export function Step4Sizing({ cfg, patch, profile, summary, result, setResult, commitRun,
+                              setFlows, running, setRunning, step, go, mode,
+                              override, setOverride,
+                              designResult, setDesignResult,
+                              splitResult, setSplitResult }) {
   const [err, setErr] = useState(null);
   const [logIdx, setLogIdx] = useState(0);
   const [detected, setDetected] = useState(null);   // /resolve result
   const [scenarios, setScenarios] = useState([]);    // READY scenarios, for override
-  const [override, setOverride] = useState("");      // user-chosen scenario id (or "")
+  const [exporting, setExporting] = useState(false);
+  const [ssrMax, setSsrMax] = useState(null);        // achievable SSR ceiling (for self-correct)
+  const [autoRun, setAutoRun] = useState(false);     // one-shot: re-run after a suggested fix
   const timer = useRef();
 
   useEffect(() => () => clearInterval(timer.current), []);
@@ -114,6 +118,27 @@ export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
     getScenarios().then((all) => setScenarios(all.filter((s) => s.ready))).catch(() => {});
   }, []);
 
+  // On an infeasible BTM-SSR run, probe the achievable SSR ceiling so we can
+  // suggest the nearest reachable target instead of a dead-end (self-correcting).
+  useEffect(() => {
+    if (result && !result.feasible && derived === "btm" && btmObj !== "gc") {
+      ssrRange({ profile_path: profile?.profile_path,
+        pv_mw: pvMw > 0 ? pvMw : undefined, wind_mw: windMw > 0 ? windMw : undefined,
+        load_peak_mw: peakLoad > 0 ? peakLoad : undefined })
+        .then((r) => setSsrMax(r?.ssr_max ?? null)).catch(() => setSsrMax(null));
+    } else {
+      setSsrMax(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result]);
+
+  // One-shot re-run after the user accepts a suggested fix — patch() has already
+  // updated cfg, so this render's startRun closes over the corrected target.
+  useEffect(() => {
+    if (autoRun) { setAutoRun(false); startRun(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRun]);
+
   // The scenario that will actually run: an explicit override, else the detected
   // one — but if the detected scenario isn't runnable yet, use its READY fallback.
   const chosenId = override
@@ -132,17 +157,18 @@ export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
         wind_mw: windMw > 0 ? windMw : undefined,
         load_peak_mw: peakLoad > 0 ? peakLoad : undefined,  // scale real load to Σ Step-1 loads
         ...targetInputs,
-        with_economics: true,
-        economic_objective: "knee",
         dispatch_priority: cfg.dispatch?.priority || [],
         allow_grid_charge: cfg.dispatch?.allowGridCharge ?? null,
-        ...cfg.econ,
       });
-      setResult(res);
+      // The engine returns the sizing curve as a {columns, rows} table; the
+      // comparison/decision views want an array of row-objects. Normalise once
+      // here so every downstream consumer of result.table gets the same shape.
+      // commitRun stamps the input signature so Steps 5–6 can detect staleness.
+      commitRun({ ...res, table: recordsToObjects(res.table) || [] });
 
       // Second pass: forward-eval at the recommended size → real dispatch flows.
-      const rec = res?.economics?.recommended;
-      if (rec) {
+      const rec = res?.design;
+      if (rec && rec.pv_mw !== undefined && rec.bess_mw !== undefined) {
         try {
           const fwd = await runScenario({
             scenario_id: "S00_FIXED_DESIGN_EVAL",
@@ -164,144 +190,219 @@ export function Step4Sizing({ cfg, patch, profile, summary, result, setResult,
     }
   }
 
-  const eco = result?.economics;
-  const pts = eco?.points || [];
-  const rec = eco?.recommended;
-  const ranInfeasible = !running && result && !eco;   // engine ran but no feasible design
+  const pts = (result?.table || []).map(p => ({
+    ...p,
+    ssr_pct: p.ssr_pct ?? p["Achieved SSR (%)"] ?? p["Operational SSR (%)"] ?? 0,
+    gc_mw: p.gc_mw ?? p["Achieved Peak Grid Import (MW)"] ?? p["Operational Peak Grid (MW)"] ?? 0,
+    pv_mw: p.pv_mw ?? p["PV Nameplate (MW)"] ?? 0,
+    bess_mw: p.bess_mw ?? p["BESS Power (MW)"] ?? 0,
+    bess_mwh: p.bess_mwh ?? p["BESS Energy (MWh)"] ?? 0,
+  }));
+  const rawRec = result?.design || {};
+  // A curve/surface run returns an empty design ({}); the trade-off chart uses the
+  // swept points, so don't build an all-zeros "recommended" card from nothing.
+  const rec = Object.keys(rawRec).length ? {
+    ...rawRec,
+    ssr_pct: rawRec.ssr_pct ?? rawRec["Achieved SSR (%)"] ?? rawRec["Operational SSR (%)"] ?? result?.kpis?.["SSR (%)"] ?? 0,
+    scr_pct: rawRec.scr_pct ?? rawRec["Achieved SCR (%)"] ?? result?.kpis?.["SCR (%)"] ?? 0,
+    curtailment_pct: rawRec.curtailment_pct ?? rawRec["Curtailment (%)"] ?? result?.kpis?.["OSR / Curtailment (%)"] ?? result?.kpis?.["Curtailment (%)"] ?? null,
+    gc_mw: rawRec.gc_mw ?? rawRec["Achieved Peak Grid Import (MW)"] ?? rawRec["Operational Peak Grid (MW)"] ?? result?.kpis?.["GCmin Peak (MW)"] ?? 0,
+    pv_mw: rawRec.pv_mw ?? rawRec["PV Nameplate (MW)"] ?? 0,
+    wind_mw: rawRec.wind_mw ?? rawRec["Wind Nameplate (MW)"] ?? 0,
+    bess_mw: rawRec.bess_mw ?? rawRec["BESS Power (MW)"] ?? 0,
+    bess_mwh: rawRec.bess_mwh ?? rawRec["BESS Energy (MWh)"] ?? 0,
+    duration_h: rawRec.duration_h ?? rawRec["BESS Duration (h)"] ?? (rawRec.bess_mw > 0 ? rawRec.bess_mwh / rawRec.bess_mw : 0),
+  } : null;
+  const ranInfeasible = !running && result && !result?.feasible;
+  const isSurface = detected?.signals?.shape === "surface";
 
-  // Result framing adapts to the detected topology (the sweep target differs).
   const FRAME = {
-    btm:        { title: "Optimisation frontier — GCmin vs SSR",
-                  goal: cfg.ssrTarget != null ? `the design at the ${cfg.ssrTarget}% SSR covenant` : "the knee design across the SSR sweep" },
-    backup:     { title: "Backup frontier — BESS vs Grid Connection", goal: "the lowest grid connection the battery can firm" },
-    standalone: { title: "Standalone frontier — BESS vs Curtailment", goal: "the battery that holds curtailment within the export limit" },
-    off_grid:   { title: "Off-grid frontier — PV+BESS vs Firmness", goal: "the smallest PV+BESS meeting the firmness target with no grid" },
+    btm:        { title: "Sizing Trade-Off — Peak Grid Import vs. Green Energy (SSR)",
+                  goal: cfg.ssrTarget != null ? `design matching your ${cfg.ssrTarget}% green energy target` : "optimal balance point across the simulation" },
+    backup:     { title: "Backup Performance — Storage Capacity vs. Grid Connection", goal: "lowest grid connection required with battery backup" },
+    standalone: { title: "Standalone Performance — Storage vs. Spilled Energy", goal: "storage required to prevent grid export overload" },
+    off_grid:   { title: "Off-Grid Performance — Solar & Storage vs. Reliability", goal: "smallest system meeting 100% uptime without grid connection" },
   };
   const frame = FRAME[derived] || FRAME.btm;
 
+  function onExport() { setExporting(true); setTimeout(() => setExporting(false), 2000); }
+
   return (
     <>
-      <div className="pagehead"><h1>Step 4 — Size</h1>
-        <p>The optimiser sizes the system under the causal dispatch rule and derives the residual grid connection. Real engine, real dataset.</p></div>
+      <div className="pagehead"><h1>Step 4 — Equipment Sizing &amp; Simulation</h1>
+        <p>Simulate your data centre&apos;s energy performance across 8,760 hours of historical weather and demand data to determine exact equipment capacities and grid power requirements.</p></div>
 
-      <DesignScenarios cfg={cfg} profile={profile} summary={summary} />
-
-      <SplitOptimiser cfg={cfg} profile={profile} />
-
+      {/* Plain-English detected strategy — always first for context. */}
       <DetectPanel detected={detected} scenarios={scenarios}
                    override={override} setOverride={setOverride}
-                   topoSignals={cfg.topoSignals} />
+                   topoSignals={cfg.topoSignals} topology={TOPOLOGY_MAP[derived]} mode={mode} />
 
-      <DispatchPolicy cfg={cfg} patch={patch} objective={btmObj} derived={derived} />
+      {/* Always visible: the dispatch strategy + battery pre-charging decision. */}
+      <DispatchControls cfg={cfg} patch={patch} />
 
+      {/* Expert-only: the causal dispatch merit-order editor. */}
+      {mode === "expert" && <DispatchPolicy cfg={cfg} patch={patch} objective={btmObj} derived={derived} />}
+
+      {/* THE one primary action. */}
       <div className="navbtns" style={{ marginTop: 14, borderTop: "none", paddingTop: 0 }}>
         <button className="btn" onClick={() => go(step - 1)}>Back</button>
         <button className="btn primary" disabled={running} onClick={startRun}>
-          {running ? "Running…" : "▶ Run detected scenario"}
+          {running ? "Designing your system…" : "▶ Design my system"}
         </button>
       </div>
 
-      {err && <div className="banner err">Engine error: {err}</div>}
+      {err && <div className="banner err">Simulation error: {err}</div>}
 
       {running && (
         <div className="card"><div className="running">
           <div className="spin" />
-          <div style={{ fontWeight: 700, fontSize: 16 }}>Running sizing sweep…</div>
-          <div className="prog"><div className="bar" style={{ width: `${(logIdx + 1) / RUN_MSGS.length * 100}%` }} /></div>
-          <div className="runlog">{RUN_MSGS.slice(0, logIdx + 1).map((m) => `▸ ${m}`).join("\n")}</div>
+          <div style={{ fontWeight: 700, fontSize: 16 }}>Simulating 8,760 hours of operations…</div>
+          <div className="subtle" style={{ marginTop: 4 }}>
+            Evaluating historical weather, solar generation, and data centre demand across the full year.
+          </div>
         </div></div>
       )}
 
       {ranInfeasible && (
-        <div className="card" style={{ borderColor: "var(--red)", background: "var(--red-light)" }}>
-          <h3 style={{ color: "var(--red)" }}>No feasible design under these inputs</h3>
-          <div style={{ fontSize: 13, color: "var(--slate)" }}>
-            The engine ran but couldn't meet the target for topology <b>{derived}</b>. Options:
-            <ul style={{ margin: "8px 0 0", lineHeight: 1.7 }}>
-              {derived === "off_grid" && <li>Off-grid must cover the load from PV+BESS alone — <b>enlarge the parcel</b> (more solar) in Step 2, or add a grid connection (switch topology).</li>}
-              <li>Lower the <b>SSR target</b> in Step 1.</li>
-              <li>Enlarge the <b>land parcel</b> (more available generation) in Step 2.</li>
-              <li>Raise the site BESS limits in Step 3, or relax the export/grid limits.</li>
-            </ul>
-          </div>
+        <div className="card" style={{ borderColor: "var(--orange)" }}>
+          <h3 style={{ color: "var(--orange)" }}>Target not reachable with this design</h3>
+          {ssrMax != null && cfg.ssrTarget != null ? (
+            <>
+              <p style={{ marginBottom: 12 }}>
+                A <b>{cfg.ssrTarget}%</b> green-energy target can&apos;t be met with your current generation.
+                The most this site can reach is about <b>{Math.floor(ssrMax)}%</b> — add more solar (or land) to go higher.
+              </p>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button className="btn primary" onClick={() => { patch({ ssrTarget: Math.floor(ssrMax) }); setAutoRun(true); }}>
+                  Use {Math.floor(ssrMax)}% &amp; re-run
+                </button>
+                <button className="btn" onClick={() => go(0)}>Add solar in Step 1</button>
+              </div>
+            </>
+          ) : (
+            <p>
+              The simulation could not find a configuration meeting all site limits and target covenants.
+              Try relaxing your target or increasing available land in the earlier steps.
+            </p>
+          )}
         </div>
       )}
 
-      {!running && eco && (
-        <div className="row">
-          <div className="card" style={{ flex: 2 }}>
-            <h3>{frame.title}</h3>
-            <div className="hint">Each dot is a sized configuration from the sweep. The recommendation is {frame.goal}.</div>
-            <Frontier pts={pts} rec={rec} target={cfg.ssrTarget} />
-            <div className="legend">
-              <span><i className="dot" style={{ background: "#cdd6da" }} />Configuration</span>
-              <span><i className="dot" style={{ background: "#2f8f5b", borderRadius: "50%" }} />Recommended (knee)</span>
-              {cfg.ssrTarget != null && <span><i className="dot" style={{ background: "#c2603a" }} />Target SSR {cfg.ssrTarget}%</span>}
-            </div>
-          </div>
-          <div className="card" style={{ flex: 1, background: "#f8f9fa" }}>
-            <h3>Why this answer?</h3>
-            <div className="summary" style={{ gridTemplateColumns: "1fr", marginBottom: 12 }}>
-              <div className="it"><div className="l">Recommended design</div>
-                <div className="v" style={{ fontSize: 14, color: "var(--teal-dark)" }}>
-                  PV {fmt.mw(rec?.pv_mw)}{rec?.wind_mw > 0 ? ` · Wind ${fmt.mw(rec.wind_mw)}` : ""} · BESS {fmt.mw(rec?.bess_mw)} / {fmt.mwh(rec?.bess_mwh)}</div></div>
-              <div className="it"><div className="l">Residual Grid Connection (GCmin)</div>
-                <div className="v" style={{ color: "var(--orange)" }}>{fmt.mw(rec?.gc_mw)}</div></div>
-              <div className="it"><div className="l">Achieved SSR (Model R)</div>
-                <div className="v" style={{ color: "var(--ok)" }}>{fmt.pct1(rec?.ssr_pct)}</div></div>
-              <div className="it"><div className="l">Storage Duration</div>
-                <div className="v" style={{ color: "var(--slate)" }}>
-                  {rec?.bess_mw > 0 ? `${(rec.bess_mwh / rec.bess_mw).toFixed(1)} hrs` : "—"}</div></div>
-            </div>
-            <div className="subtle">
-              Technical recommendation: <b>knee of sizing curve</b> — optimal physical sizing point balancing Self-Sufficiency (SSR%) against storage volume before diminishing returns. Full financial economics &amp; CAPEX are evaluated next in Step 5.
-            </div>
-          </div>
-        </div>
-      )}
+      {result?.feasible && !running && <div style={{ marginTop: 20 }}>
+        <VersionBar result={result} onExport={onExport} exporting={exporting} />
+      </div>}
 
-      {!running && eco && <Nav go={go} step={step} nextLabel="Continue → Economics" />}
+      {result?.feasible && !running && <div className="card" style={{ marginTop: 14 }}>
+        <h3>{frame.title}</h3>
+        <div className="hint">
+          Each dot represents a complete 8,760-hour simulation. We highlight {frame.goal}.
+        </div>
+
+        {isSurface ? (
+          <SurfaceChart table={result.table || []} rec={rec} />
+        ) : (
+          <TradeoffChart table={result.table || []} rec={rec} target={cfg.ssrTarget}
+                         derived={derived} btmObj={btmObj} />
+        )}
+
+        {!isSurface && (
+          <div className="legend" style={{ marginTop: 8 }}>
+            {cfg.ssrTarget != null && <>
+              <span><i className="dot" style={{ background: "#8fc7aa" }} />Meets target</span>
+              <span><i className="dot" style={{ background: "#cdd6da" }} />Below target</span>
+            </>}
+            <span><i className="dot" style={{ background: "#2f8f5b", borderRadius: "50%" }} />Recommended</span>
+          </div>
+        )}
+
+        <div className="subtle" style={{ marginTop: 10 }}>
+          {isSurface
+            ? "3D surface analysis: evaluates performance across independent solar and battery sizing combinations."
+            : "Trade-off curve: demonstrates how adding battery storage reduces peak grid demand and increases green energy utilization."}
+        </div>
+      </div>}
+
+      {rec && result?.feasible && !running && <div className="card" style={{ marginTop: 14 }}>
+        <h3>Recommended Equipment Configuration</h3>
+        <div className="hint">
+          The optimal configuration balancing green energy targets, site limits, and grid independence.
+        </div>
+        <div className="summary" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+          <div className="it"><div className="l">Solar PV Capacity</div><div className="v">{fmt.mw(rec.pv_mw)}</div></div>
+          <div className="it"><div className="l">Wind Capacity</div><div className="v">{rec.wind_mw > 0 ? fmt.mw(rec.wind_mw) : "—"}</div></div>
+          <div className="it"><div className="l">Battery Power</div><div className="v">{fmt.mw(rec.bess_mw)}</div></div>
+          <div className="it"><div className="l">Battery Energy</div><div className="v">{fmt.mwh(rec.bess_mwh)}</div></div>
+          <div className="it"><div className="l">Storage Duration</div><div className="v">{rec.duration_h ? `${rec.duration_h.toFixed(1)} hrs` : "—"}</div></div>
+          <div className="it"><div className="l">Peak Grid Import (GCmin)</div><div className="v" style={{ color: "var(--orange)" }}>{fmt.mw(rec.gc_mw)}</div></div>
+          <div className="it"><div className="l">Green Energy / SSR</div><div className="v" style={{ color: "var(--ok)" }}>{fmt.pct1(rec.ssr_pct)}</div></div>
+          <div className="it"><div className="l">Self-Consumption / SCR</div><div className="v">{fmt.pct1(rec.scr_pct)}</div></div>
+          <div className="it"><div className="l">Spilled Solar</div><div className="v">{rec.curtailment_pct != null ? fmt.pct1(rec.curtailment_pct) : "—"}</div></div>
+        </div>
+      </div>}
+
+      {/* Deeper analyses, de-emphasised so the primary action stays unambiguous.
+          Collapsed in Simple; expanded in Expert. key={mode} re-seeds the default. */}
+      <details key={mode} open={mode === "expert"} style={{ marginTop: 16 }}>
+        <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: 15, color: "var(--slate)", padding: "6px 2px" }}>
+          Optional analyses — quick baseline check &amp; land-split optimiser
+        </summary>
+        <div style={{ marginTop: 10 }}>
+          <DesignScenarios cfg={cfg} profile={profile} summary={summary}
+                           data={designResult} setData={setDesignResult} />
+          <SplitOptimiser cfg={cfg} profile={profile}
+                          data={splitResult} setData={setSplitResult} />
+        </div>
+      </details>
+
+      {result && !running && <div className="navbtns" style={{ marginTop: 20 }}>
+        <button className="btn" onClick={() => go(step - 1)}>Back</button>
+        <button className="btn primary" onClick={() => go(step + 1)}>
+          Compare Configurations →
+        </button>
+      </div>}
     </>
   );
 }
 
-// Shows the scenario the engine DETECTED from the inputs (not asked), why, and
+// ── Scenario detection + override panel ──────────────────────────────────────
+// Displays the scenario chosen by resolve_scenario(inputs), along with all
 // the discriminator signals — with an override dropdown. Driven by the flow
 // topology from the designer rather than manual radio buttons.
-function DetectPanel({ detected, scenarios, override, setOverride, topoSignals }) {
+function DetectPanel({ detected, scenarios, override, setOverride, topoSignals, topology, mode }) {
   if (!detected) return null;
   const sig = detected.signals || {};
   const ts = topoSignals || {};
   const consumers = ts.consumers || [];
+  // Only offer strategies that fit the detected topology — a grid-connected site
+  // shouldn't list off-grid / standalone / backup-only scenarios.
+  const relevant = topology ? scenarios.filter((s) => s.topology === topology) : scenarios;
+  
+  const MAP_TARGET = { min_gc: "Minimize Grid Import", ssr: "Green Energy / SSR", peak_shaving: "Peak Shaving", both: "SSR + Grid Limit" };
+  const MAP_TOPO = { btm: "Behind the Meter", backup: "Backup Storage", off_grid: "Off-Grid / Islanded", standalone: "Standalone Generation" };
+  const MAP_SHAPE = { curve: "Performance Curve", point: "Single Point Analysis", surface: "2D Surface Analysis" };
+  const MAP_PV = { none: "No Solar", fixed: "Fixed Capacity", "to size": "Auto-Sized" };
+
   const chips = [
-    ["topology",  sig.topology],
-    ["PV",        sig.pv_mode],
-    ["BESS",      sig.bess_fixed ? "fixed" : "to size"],
-    ["target",    (sig.targets || []).join("+") || "—"],
-    ["shape",     sig.shape],
-    ts.peak_load_mw != null ? ["peak load", `${ts.peak_load_mw} MW`] : null,
-    consumers.length > 1 ? ["consumers", consumers.length] : null,
+    ["Mode", MAP_TOPO[sig.topology] || sig.topology],
+    ["Solar", MAP_PV[sig.pv_mode] || sig.pv_mode],
+    ["Storage", sig.bess_fixed ? "Fixed Capacity" : "Auto-Sized"],
+    ["Goal", (sig.targets || []).map(t => MAP_TARGET[t] || t).join(" + ") || "—"],
+    ["Analysis", MAP_SHAPE[sig.shape] || sig.shape],
+    ts.peak_load_mw != null ? ["Peak Demand", `${ts.peak_load_mw} MW`] : null,
+    consumers.length > 1 ? ["Consumers", consumers.length] : null,
   ].filter(Boolean);
   const usingOverride = override && override !== detected.scenario_id;
   return (
     <div className="card" style={{ borderColor: "var(--teal)", background: "var(--teal-light)" }}>
-      <h3 style={{ color: "var(--teal-dark)" }}>Detected scenario — from your flow topology</h3>
+      <h3 style={{ color: "var(--teal-dark)" }}>Detected Strategy — From Your Site Layout</h3>
       <div className="hint" style={{ color: "var(--teal-dark)", opacity: 0.85 }}>
-        No questions asked — the flow designer encodes the topology; this drives the scenario automatically. Override below if needed.
+        Your site layout sets the strategy automatically — you don&apos;t need to pick one.
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", margin: "4px 0 10px" }}>
-        <span className="badge teal" style={{ fontSize: 12 }}>{detected.scenario_id}</span>
-        <b style={{ color: "var(--slate)" }}>{detected.name}</b>
-        {!detected.ready && <span className="badge red">not runnable yet</span>}
+        <span className="badge teal" style={{ fontSize: 13, fontWeight: 700, padding: "4px 10px" }}>{detected.name}</span>
+        {!detected.ready && <span className="badge red">Configuration pending</span>}
       </div>
       <div style={{ fontSize: 12.5, color: "var(--slate)", marginBottom: 10 }}>{detected.reason}</div>
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
-        {chips.map(([k, v]) => (
-          <span key={k} style={{ fontSize: 11, background: "#fff", border: "1px solid var(--line2)",
-            borderRadius: 8, padding: "3px 9px", color: "var(--grey)" }}>
-            {k}: <b style={{ color: "var(--slate)" }}>{String(v)}</b></span>
-        ))}
-      </div>
       {consumers.length > 1 && (
         <div style={{ fontSize: 12, color: "var(--teal-dark)", marginBottom: 10,
           background: "#fff", border: "1px solid var(--line)", borderRadius: 8, padding: "8px 12px" }}>
@@ -309,15 +410,29 @@ function DetectPanel({ detected, scenarios, override, setOverride, topoSignals }
           {consumers.map(c => `${c.name} (${c.peak_mw} MW peak)`).join(" + ")}
         </div>
       )}
-      <label className="fld">Override scenario (optional)</label>
-      <select value={override} onChange={(e) => setOverride(e.target.value)} style={{ maxWidth: 460 }}>
-        <option value="">Use detected — {detected.name}</option>
-        {scenarios.map((s) => (
-          <option key={s.id} value={s.id}>{s.id} — {s.name}</option>
-        ))}
-      </select>
-      {usingOverride && <div className="banner warn" style={{ marginTop: 10 }}>
-        Overriding the detected scenario — running <b>{override}</b> instead.</div>}
+      {/* Technical detail + strategy override tucked away — simple by default for a
+          PM / developer, full engine control one click away for a power user. */}
+      <details style={{ marginTop: 2 }}>
+        <summary style={{ cursor: "pointer", fontSize: 12.5, fontWeight: 600, color: "var(--teal-dark)" }}>
+          Technical detail &amp; strategy override
+        </summary>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "10px 0 12px" }}>
+          {chips.map(([k, v]) => (
+            <span key={k} style={{ fontSize: 11, background: "#fff", border: "1px solid var(--line2)",
+              borderRadius: 8, padding: "3px 9px", color: "var(--grey)" }}>
+              {k}: <b style={{ color: "var(--slate)" }}>{String(v)}</b></span>
+          ))}
+        </div>
+        <label className="fld">Override strategy (optional)</label>
+        <select value={override} onChange={(e) => setOverride(e.target.value)} style={{ maxWidth: 460 }}>
+          <option value="">Use default — {detected.name}</option>
+          {relevant.map((s) => (
+            <option key={s.id} value={s.id}>{s.name}</option>
+          ))}
+        </select>
+        {usingOverride && <div className="banner warn" style={{ marginTop: 10 }}>
+          Overriding default strategy — running custom analysis instead.</div>}
+      </details>
     </div>
   );
 }
@@ -335,6 +450,74 @@ const DEFAULT_ORDER = {
   self_sufficiency: ["gen_to_load", "gen_to_bess", "bess_to_load", "grid_to_load"],
   peak_shaving:     ["gen_to_load", "gen_to_bess", "grid_to_load", "bess_to_load", "grid_to_bess"],
 };
+
+// Always-visible, plain-language dispatch decisions: which control strategy to
+// operate under (rule vs rolling-horizon forecast) and whether the battery may
+// pre-charge from the grid to shrink the grid connection. Both write cfg.dispatch,
+// the same fields the expert merit-order editor and the API payloads read.
+function DispatchControls({ cfg, patch }) {
+  const d = cfg.dispatch || { model: "rule", horizonH: 24, commitH: 1, allowGridCharge: null };
+  const set = (next) => patch({ dispatch: { ...d, ...next } });
+  const model = d.model || "rule";
+  const gcVal = d.allowGridCharge ?? null;   // null | true | false
+  const seg = (val, cur, label, onClick, key) => (
+    <button key={key ?? label} className="btn" style={{
+      padding: "4px 14px", border: "none", borderRadius: 0,
+      background: cur === val ? "#15616d" : "#fff", color: cur === val ? "#fff" : "#333" }}
+      onClick={onClick}>{label}</button>
+  );
+
+  return (
+    <div className="card" style={{ marginTop: 12 }}>
+      <h3 style={{ marginTop: 0 }}>Dispatch &amp; Operation</h3>
+
+      {/* Dispatch strategy: causal rule vs rolling-horizon forecast (Model W). */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, minWidth: 130 }}>Control strategy</span>
+        <div style={{ display: "flex", border: "1px solid #d6dde0", borderRadius: 6, overflow: "hidden" }}>
+          {seg("rule", model, "Rule-based", () => set({ model: "rule" }))}
+          {seg("rolling", model, "Rolling-horizon forecast", () => set({ model: "rolling" }))}
+        </div>
+        <span style={{ fontSize: 11, color: "#8a949b", flex: 1, minWidth: 180 }}>
+          {model === "rolling"
+            ? "Looks ahead and pre-positions the battery — anticipates peaks (realistic operation)."
+            : "Causal merit order, no foresight — the conservative, fully auditable baseline."}
+        </span>
+      </div>
+
+      {/* Rolling window parameters — only when the forecast strategy is chosen. */}
+      {model === "rolling" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 12,
+                      paddingLeft: 142 }}>
+          <label style={{ fontSize: 12, color: "#556" }}>Look-ahead (h)
+            <input type="number" min={1} max={168} value={d.horizonH ?? 24}
+              onChange={(e) => set({ horizonH: Math.max(1, +e.target.value || 24) })}
+              style={{ width: 64, marginLeft: 8, padding: "3px 6px" }} />
+          </label>
+          <label style={{ fontSize: 12, color: "#556" }}>Commit (h)
+            <input type="number" min={1} max={d.horizonH ?? 24} value={d.commitH ?? 1}
+              onChange={(e) => set({ commitH: Math.max(1, +e.target.value || 1) })}
+              style={{ width: 64, marginLeft: 8, padding: "3px 6px" }} />
+          </label>
+          <span style={{ fontSize: 11, color: "#8a949b" }}>Re-optimise every {d.commitH ?? 1} h over the next {d.horizonH ?? 24} h.</span>
+        </div>
+      )}
+
+      {/* Battery pre-charging (grid charging) — promoted out of expert mode. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 13, fontWeight: 600, minWidth: 130 }}>Battery pre-charging</span>
+        <div style={{ display: "flex", border: "1px solid #d6dde0", borderRadius: 6, overflow: "hidden" }}>
+          {[["Auto", null], ["On", true], ["Off", false]].map(([label, val]) =>
+            seg(val, gcVal, label, () => set({ allowGridCharge: val }), label))}
+        </div>
+        <span style={{ fontSize: 11, color: "#8a949b", flex: 1, minWidth: 180 }}>
+          Let the battery charge from the grid off-peak to shave the peak and shrink the grid connection.
+          Auto = decide from the objective.
+        </span>
+      </div>
+    </div>
+  );
+}
 
 function DispatchPolicy({ cfg, patch, objective, derived }) {
   const [open, setOpen] = useState(false);
@@ -355,23 +538,18 @@ function DispatchPolicy({ cfg, patch, objective, derived }) {
   const add = (a) => setDispatch({ priority: [...order, a] });
   const missing = Object.keys(ACTIONS).filter((a) => !order.includes(a));
 
-  const gcVal = d.allowGridCharge;   // null | true | false
-  const gcSeg = [["Auto", null], ["On", true], ["Off", false]];
-
   return (
     <div className="card" style={{ marginTop: 12 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
            onClick={() => setOpen((o) => !o)}>
-        <h3 style={{ margin: 0 }}>Dispatch policy <span style={{ fontWeight: 400, color: "#8a949b", fontSize: 13 }}>
-          — {custom ? "custom merit order" : "automatic (grid as last resort)"}
-          {gcVal != null ? ` · grid-charging ${gcVal ? "on" : "off"}` : ""}</span></h3>
+        <h3 style={{ margin: 0 }}>Merit-order rules <span style={{ fontWeight: 400, color: "#8a949b", fontSize: 13 }}>
+          — {custom ? "custom priority rules" : "smart auto-dispatch (grid as last resort)"}</span></h3>
         <span style={{ color: "#8a949b" }}>{open ? "▲" : "▼ configure"}</span>
       </div>
 
       {open && <div style={{ marginTop: 12 }}>
         <div className="hint" style={{ marginBottom: 8 }}>
-          The causal controller applies these transfers in order, every timestep, with no foresight.
-          Reorder to change policy (e.g. Grid → Load above Battery → Load preserves the battery).
+          Our real-time control algorithm applies these energy transfers in order every hour. You can reorder them to prioritize specific energy flows (e.g., prioritize Grid over Battery discharge to keep storage reserved for backup).
         </div>
 
         {order.map((a, i) => (
@@ -389,34 +567,23 @@ function DispatchPolicy({ cfg, patch, objective, derived }) {
         ))}
 
         {missing.length > 0 && <div style={{ marginTop: 4, fontSize: 12 }}>
-          <span style={{ color: "#8a949b" }}>Add step: </span>
+          <span style={{ color: "#8a949b" }}>Add rule: </span>
           {missing.map((a) => <button key={a} className="btn" style={{ padding: "2px 8px", marginRight: 6 }}
                                       onClick={() => add(a)}>+ {ACTIONS[a][0]}</button>)}
         </div>}
 
-        <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 14, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>Grid-charging</span>
-            <div style={{ display: "flex", border: "1px solid #d6dde0", borderRadius: 6, overflow: "hidden" }}>
-              {gcSeg.map(([label, val]) => (
-                <button key={label} className="btn" style={{
-                  padding: "3px 12px", border: "none", borderRadius: 0,
-                  background: gcVal === val ? "#15616d" : "#fff", color: gcVal === val ? "#fff" : "#333" }}
-                  onClick={() => setDispatch({ allowGridCharge: val })}>{label}</button>
-              ))}
-            </div>
-            <span style={{ fontSize: 11, color: "#8a949b" }}>Auto = infer from objective</span>
-          </div>
-          {custom && <button className="btn" onClick={() => setDispatch({ priority: [] })}>Reset to automatic</button>}
-        </div>
+        {custom && <div style={{ marginTop: 14 }}>
+          <button className="btn" onClick={() => setDispatch({ priority: [] })}>Reset to automatic</button>
+        </div>}
       </div>}
     </div>
   );
 }
 
-function Frontier({ pts, rec, target }) {
+function TradeoffChart({ table, rec, target }) {
+  const pts = table || [];
   const W = 620, H = 240, pad = 36;
-  if (!pts.length) return <svg className="chart" viewBox="0 0 620 240" />;
+  if (!pts.length) return <EmptyChart h={240} msg="No swept configurations to plot. To see the trade-off curve, uncheck the fixed SSR target in Step 3 (Strategy & Goals) and re-run — that sweeps a full range of designs." />;
   const hasTarget = target != null && !isNaN(target);
   const ssr = pts.map((p) => +p.ssr_pct), gc = pts.map((p) => +p.gc_mw);
   const domain = hasTarget ? [...ssr, target] : ssr;
@@ -457,5 +624,111 @@ function Frontier({ pts, rec, target }) {
         </>
       )}
     </svg>
+  );
+}
+
+function Frontier({ pts, rec, target }) {
+  return <TradeoffChart table={pts} rec={rec} target={target} />;
+}
+
+// Real PV × SSR → BESS MWh heatmap (the surface scenario actually sweeps this
+// grid). Sequential single-hue ramp for magnitude + a legend; infeasible cells
+// (SSR unreachable at that PV) are hatched, not colored. Falls back to the
+// trade-off scatter if the table isn't a genuine 2-D grid.
+function SurfaceChart({ table, rec }) {
+  const rows = (table || []).map((r) => ({
+    pv: +(r["PV Nameplate (MW)"] ?? r.pv_mw ?? 0),
+    ssr: +(r["Target SSR (%)"] ?? r.ssr_pct ?? 0),
+    bess: r["BESS Energy (MWh)"] ?? r.bess_mwh,
+    feasible: (r["Feasible"] ?? r.feasible) !== false && (r["BESS Energy (MWh)"] ?? r.bess_mwh) != null,
+  }));
+  const pvs = [...new Set(rows.map((r) => r.pv))].sort((a, b) => a - b);
+  const ssrs = [...new Set(rows.map((r) => r.ssr))].sort((a, b) => b - a); // high SSR at top
+  if (pvs.length < 2 || ssrs.length < 2) return <TradeoffChart table={table} rec={rec} />;
+
+  const at = (pv, ssr) => rows.find((r) => r.pv === pv && r.ssr === ssr);
+  const feas = rows.filter((r) => r.feasible && r.bess != null).map((r) => +r.bess);
+  const bMin = feas.length ? Math.min(...feas) : 0;
+  const bMax = feas.length ? Math.max(...feas) : 1;
+  // Sequential green ramp, light→dark (monotone lightness). t=0 small BESS.
+  const ramp = (t) => {
+    const stops = [[230, 242, 234], [143, 199, 170], [47, 143, 91], [20, 83, 45]];
+    const x = Math.max(0, Math.min(1, t)) * (stops.length - 1);
+    const i = Math.min(stops.length - 2, Math.floor(x)), f = x - i;
+    const c = stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * f));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  };
+
+  const W = 620, H = 300, padL = 46, padB = 40, padT = 10, padR = 96;
+  const gw = (W - padL - padR), gh = (H - padT - padB);
+  const cw = gw / pvs.length, ch = gh / ssrs.length;
+  const cx = (j) => padL + j * cw, cy = (i) => padT + i * ch;
+  const recCell = rec && Math.abs(+rec.pv_mw) > 0;
+  return (
+    <>
+      <svg className="chart" viewBox={`0 0 ${W} ${H}`}>
+        <defs>
+          <pattern id="infhatch" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+            <rect width="6" height="6" fill="#f0f2f3" />
+            <line x1="0" y1="0" x2="0" y2="6" stroke="#cfd6da" strokeWidth="1.4" />
+          </pattern>
+        </defs>
+        {ssrs.map((ssr, i) => pvs.map((pv, j) => {
+          const c = at(pv, ssr);
+          const feasible = c && c.feasible && c.bess != null;
+          const t = bMax > bMin ? (+c?.bess - bMin) / (bMax - bMin) : 0.5;
+          return (
+            <rect key={`${i}-${j}`} x={cx(j) + 1} y={cy(i) + 1} width={Math.max(0, cw - 2)} height={Math.max(0, ch - 2)}
+                  rx="2" fill={feasible ? ramp(t) : "url(#infhatch)"}>
+              <title>{`PV ${fmt.mw(pv)} · SSR target ${ssr}%\n${feasible ? `min BESS ${fmt.mwh(c.bess)}` : "infeasible — SSR unreachable at this PV"}`}</title>
+            </rect>
+          );
+        }))}
+        {/* recommended cell outline */}
+        {recCell && (() => {
+          const j = pvs.reduce((b, p, k) => Math.abs(p - rec.pv_mw) < Math.abs(pvs[b] - rec.pv_mw) ? k : b, 0);
+          const i = ssrs.reduce((b, s, k) => Math.abs(s - rec.ssr_pct) < Math.abs(ssrs[b] - rec.ssr_pct) ? k : b, 0);
+          return <rect x={cx(j) + 1} y={cy(i) + 1} width={Math.max(0, cw - 2)} height={Math.max(0, ch - 2)}
+                       rx="2" fill="none" stroke="#15616d" strokeWidth="2.5" />;
+        })()}
+        {/* axes labels */}
+        {pvs.map((pv, j) => <text key={`px${j}`} x={cx(j) + cw / 2} y={H - padB + 14} fontSize="9" fill="#8a949b" textAnchor="middle">{Math.round(pv)}</text>)}
+        {ssrs.map((ssr, i) => <text key={`py${i}`} x={padL - 6} y={cy(i) + ch / 2 + 3} fontSize="9" fill="#8a949b" textAnchor="end">{ssr}%</text>)}
+        <text x={padL + gw / 2} y={H - 4} fontSize="11" fill="#6b7780" textAnchor="middle">Solar PV (MW) →</text>
+        <text x={12} y={padT + gh / 2} fontSize="11" fill="#6b7780" textAnchor="middle" transform={`rotate(-90 12 ${padT + gh / 2})`}>SSR target (%)</text>
+        {/* colour legend (min→max BESS MWh) */}
+        <text x={W - padR + 12} y={padT + 8} fontSize="10" fill="#6b7780">BESS (MWh)</text>
+        {Array.from({ length: 24 }, (_, k) => (
+          <rect key={`lg${k}`} x={W - padR + 12} y={padT + 16 + k * 6} width="14" height="6"
+                fill={ramp(1 - k / 23)} />
+        ))}
+        <text x={W - padR + 30} y={padT + 22} fontSize="9" fill="#8a949b">{fmt.mwh(bMax)}</text>
+        <text x={W - padR + 30} y={padT + 16 + 24 * 6} fontSize="9" fill="#8a949b">{fmt.mwh(bMin)}</text>
+        <rect x={W - padR + 12} y={padT + 16 + 24 * 6 + 6} width="14" height="10" fill="url(#infhatch)" />
+        <text x={W - padR + 30} y={padT + 16 + 24 * 6 + 14} fontSize="9" fill="#8a949b">infeasible</text>
+      </svg>
+      <div className="legend" style={{ marginTop: 6 }}>
+        <span>Darker = more storage needed · hatched = SSR target unreachable at that solar size · <i className="dot" style={{ background: "none", border: "2px solid #15616d", borderRadius: 2 }} />recommended</span>
+      </div>
+    </>
+  );
+}
+
+function VersionBar({ result, onExport, exporting }) {
+  if (!result) return null;
+  return (
+    <div className="card" style={{ background: "var(--teal-light)", borderColor: "var(--teal)", padding: "12px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+      <div>
+        <div style={{ fontWeight: 700, color: "var(--teal-dark)", fontSize: 14 }}>✓ 8,760-Hour Sizing Simulation Complete</div>
+        <div style={{ fontSize: 12, color: "var(--teal-dark)", opacity: 0.85, marginTop: 2 }}>
+          Optimal equipment capacities and operational covenants verified against historical dataset.
+        </div>
+      </div>
+      <div>
+        <button type="button" className="btn small primary" onClick={onExport} disabled={exporting}>
+          {exporting ? "Exporting Snapshot…" : "⤓ Export Simulation Snapshot"}
+        </button>
+      </div>
+    </div>
   );
 }

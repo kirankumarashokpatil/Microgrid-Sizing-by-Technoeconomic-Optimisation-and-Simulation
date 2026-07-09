@@ -32,6 +32,7 @@ button{font-family:inherit;}
 .pill{font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px;}
 .pill.ready{background:var(--ok-light);color:var(--ok);}
 .pill.down{background:var(--red-light);color:var(--red);}
+.pill.warn{background:var(--orange-light);color:var(--orange);}
 
 /* ── live metric strip ── */
 .metricstrip{display:flex;background:#fff;border-bottom:1px solid var(--line);padding:0 22px;position:sticky;top:100px;z-index:18;}
@@ -48,11 +49,12 @@ button{font-family:inherit;}
 /* ── layout ── */
 .shell{display:flex;min-height:calc(100vh - 100px);}
 .stepper{width:248px;background:#fff;border-right:1px solid var(--line);padding:24px 16px;flex-shrink:0;}
-.stepper .s{display:flex;gap:12px;padding:11px 10px;border-radius:8px;cursor:pointer;margin-bottom:2px;align-items:center;}
-.stepper .s:hover{background:#f6f9f9;}
-.stepper .s.active{background:var(--teal-light);}
+.stepper .s{display:flex;gap:12px;padding:11px 10px;border-radius:8px;cursor:pointer;margin-bottom:2px;align-items:center;transition:all 0.18s cubic-bezier(0.4, 0, 0.2, 1);}
+.stepper .s:hover{background:#f6f9f9;transform:translateX(3px);}
+.stepper .s.active{background:var(--teal-light);box-shadow:0 2px 8px rgba(31,138,138,0.12);}
 .stepper .s.done .num{background:var(--ok);}
-.stepper .num{width:26px;height:26px;border-radius:50%;background:var(--line2);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0;}
+.stepper .num{width:26px;height:26px;border-radius:50%;background:var(--line2);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0;transition:transform 0.18s ease;}
+.stepper .s:hover .num{transform:scale(1.08);}
 .stepper .s.active .num{background:var(--teal);}
 .stepper .s .lab{font-size:13px;}
 .stepper .s .lab b{display:block;color:var(--slate);}
@@ -73,7 +75,8 @@ button{font-family:inherit;}
 .pagehead h1{margin:0;font-size:23px;color:var(--slate);}
 .pagehead p{margin:6px 0 0;color:var(--grey);font-size:14px;}
 
-.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-top:20px;box-shadow:0 1px 3px rgba(0,0,0,.03);}
+.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-top:20px;box-shadow:0 1px 3px rgba(0,0,0,.03);transition:box-shadow 0.2s ease,border-color 0.2s ease;}
+.card:hover{box-shadow:0 8px 24px rgba(0,0,0,0.06);border-color:#cbd5e1;}
 .card h3{margin:0 0 4px;font-size:15px;color:var(--slate);}
 .card .hint{color:var(--grey);font-size:12.5px;margin-bottom:14px;}
 
@@ -90,9 +93,9 @@ input:focus,select:focus{outline:none;border-color:var(--teal);box-shadow:0 0 0 
 
 /* selectable cards */
 .choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:6px;}
-.choice{border:1.5px solid var(--line2);border-radius:10px;padding:16px;cursor:pointer;transition:.15s;background:#fff;}
-.choice:hover{border-color:var(--teal);}
-.choice.sel{border-color:var(--teal);background:var(--teal-light);box-shadow:0 0 0 3px rgba(31,138,138,.12);}
+.choice{border:1.5px solid var(--line2);border-radius:10px;padding:16px;cursor:pointer;transition:all 0.18s cubic-bezier(0.4, 0, 0.2, 1);background:#fff;}
+.choice:hover{border-color:var(--teal);transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,0.06);}
+.choice.sel{border-color:var(--teal);background:var(--teal-light);box-shadow:0 0 0 3px rgba(31,138,138,.15),0 4px 12px rgba(31,138,138,0.1);}
 .choice .ic{font-size:24px;}
 .choice .t{font-weight:700;margin-top:8px;color:var(--slate);}
 .choice .d{font-size:12px;color:var(--grey);margin-top:3px;}
@@ -157,11 +160,12 @@ tr.rejected td{opacity:.55;}
 
 /* footer nav */
 .navbtns{display:flex;justify-content:space-between;margin-top:28px;padding-top:18px;border-top:1px solid var(--line);align-items:center;gap:10px;}
-.btn{padding:11px 24px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:1px solid var(--line2);background:#fff;color:var(--slate);}
-.btn:hover{border-color:var(--grey);}
-.btn:disabled{opacity:.5;cursor:not-allowed;}
-.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff;}
-.btn.primary:hover{background:var(--teal-dark);}
+.btn{padding:11px 24px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:1px solid var(--line2);background:#fff;color:var(--slate);transition:all 0.15s cubic-bezier(0.4, 0, 0.2, 1);box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+.btn:hover{border-color:var(--teal);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.08);}
+.btn:active{transform:translateY(0);}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none;}
+.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff;box-shadow:0 2px 8px rgba(21,97,109,0.25);}
+.btn.primary:hover{background:var(--teal-dark);border-color:var(--teal-dark);box-shadow:0 6px 16px rgba(21,97,109,0.35);}
 .btn.small{padding:5px 12px;font-size:12px;}
 .btn.ghost{background:none;border:none;color:var(--teal-dark);}
 
@@ -198,6 +202,10 @@ tr.rejected td{opacity:.55;}
 .fd-node-block{border:1px solid var(--line2);margin-bottom:8px;border-radius:6px;overflow:hidden;}
 .fd-node-hd{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#f8fafa;border-bottom:1px solid var(--line2);}
 .fd-node-row{padding:6px 8px;background:#fff;border-bottom:1px solid var(--line);}
-.fd-node-row:last-of-type{border-bottom:none;}
 .fd-add-btn{width:100%;padding:4px;border:1px dashed var(--line2);border-top:none;background:transparent;color:var(--grey);cursor:pointer;font-size:10.5px;transition:all .15s;border-radius:0 0 6px 6px;}
 .fd-add-btn:hover{background:var(--teal-light);color:var(--teal-dark);border-color:var(--teal);}
+
+/* ── Client Showcase Map ── */
+.custom-showcase-pin { background: transparent; border: none; }
+.asset-symbol-pin:hover { transform: translate(-50%, -50%) scale(1.22) !important; z-index: 1000 !important; box-shadow: 0 6px 16px rgba(0,0,0,0.6) !important; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }

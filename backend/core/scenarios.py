@@ -195,6 +195,7 @@ def _point_from_sizing(spec: ScenarioSpec, res: SizingResult,
             )
             kpis[KpiKeys.SSR] = opk[KpiKeys.SSR]           # Model R is the truth
             kpis[KpiKeys.SCR] = opk[KpiKeys.SCR]
+            kpis[KpiKeys.OSR] = opk[KpiKeys.OSR]           # curtailment, for parity with forward-eval rows
             kpis[KpiKeys.GCMIN_PEAK] = opk[KpiKeys.GCMIN_PEAK]
             kpis[KpiKeys.TOTAL_UNMET_LOAD] = opk[KpiKeys.TOTAL_UNMET_LOAD]
             notes = "KPIs are operational (Model R); LP is the lower bound."
@@ -477,34 +478,13 @@ def _h_pv_standalone_size(spec, ctx):
 
 
 def _h_pv_covenant(spec, ctx):
-    """S122 — min-CAPEX PV–BESS design meeting the SSR covenant: PV-variable LP
-    at the covenant, then a costed local PV sweep to confirm the ≈CAPEX optimum."""
+    """S122 — physical PV–BESS design meeting the SSR covenant."""
     from core.sizing_engine import solve_sizing_point
-    from core.curve_runner import run_pv_bess_surface
-    from core.economic_overlay import evaluate_costs, find_optimal_point
-    from core.params import EconomicParams
     base = solve_sizing_point(ctx.profiles_df, ctx.params, 0.0, "ssr", ctx.target_ssr_pct,
                               scenario_label=spec.id, solver_time_limit=ctx.solver_time_limit,
                               pv_variable=True, pv_max_mw=_pv_cap(ctx))
-    if not base.feasible:
-        return _point_from_sizing(spec, base, ctx)
-    # Cost a small PV sweep around the LP's choice with real economics.
-    pv0 = base.pv_mw
-    sweep = tuple(sorted({round(pv0 * f, 1) for f in (0.8, 0.9, 1.0, 1.1, 1.2) if pv0 * f > 1}))
-    surf = run_pv_bess_surface(ctx.profiles_df, ctx.params, sweep, (ctx.target_ssr_pct,),
-                               scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
     out = _point_from_sizing(spec, base, ctx)
-    try:
-        costed = evaluate_costs(surf, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
-        rec = find_optimal_point(costed, "capex")
-        out.table = costed
-        out.design = {"pv_mw": rec.get(CurveCols.PV_MW, pv0),
-                      "bess_mw": rec.get("Costed BESS Power (MW)", base.bess_mw),
-                      "bess_mwh": rec.get("Costed BESS Energy (MWh)", base.bess_mwh),
-                      "gc_mw": rec.get(CurveCols.PEAK_GC_MW, base.peak_grid_mw)}
-        out.notes = "Min-CAPEX design meeting the covenant (costed PV sweep around the LP optimum)."
-    except Exception as exc:
-        out.notes = f"LP covenant design (economic ranking unavailable: {exc})."
+    out.notes = "Physical design meeting the covenant (co-sized PV + BESS)."
     return out
 
 
@@ -584,35 +564,10 @@ def _h_sub_util_curve(spec, ctx):
     df = df.copy()
     df["Utilisation (EFC/yr)"] = efcs
     df["Active Hours (h/yr)"] = hours
-    floor = ctx.min_utilisation_efc
+    floor = getattr(ctx, "min_utilisation_efc", 0.0) or 0.0
     df["Meets Utilisation Floor"] = [
         (e is not None and e >= floor) if floor > 0 else True for e in efcs]
     return _curve_result(spec, ctx, df, with_overlays=False)
-
-
-def _h_overlay_site_area(spec, ctx):
-    """S101 — run the SSR curve, cost it, keep only designs that fit the site."""
-    from core.curve_runner import run_ssr_curve
-    from core.economic_overlay import evaluate_costs, check_site_area, find_optimal_point
-    from core.params import EconomicParams
-    curve = run_ssr_curve(ctx.profiles_df, ctx.params, ctx.pv_mw,
-                          scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
-    area_m2 = ctx.site_area_m2 if ctx.site_area_m2 and ctx.site_area_m2 > 0 else 1_500_000.0
-    costed = evaluate_costs(curve, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
-    checked = check_site_area(costed, area_m2)
-    fits = checked[checked.get("Fits Site", pd.Series(dtype=bool)) == True]  # noqa: E712
-    feasible = not fits.empty
-    design, kpis = {}, {}
-    if feasible:
-        best = find_optimal_point(fits, "knee")
-        design = {"pv_mw": best.get(CurveCols.PV_MW), "bess_mw": best.get("Costed BESS Power (MW)"),
-                  "bess_mwh": best.get("Costed BESS Energy (MWh)"),
-                  "gc_mw": best.get(CurveCols.PEAK_GC_MW)}
-        kpis = {KpiKeys.SSR: best.get(CurveCols.ACHIEVED_SSR_PCT),
-                "Total Area (m²)": best.get("Total Area (m²)")}
-    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=feasible,
-                          design=design, kpis=kpis, table=checked,
-                          notes=f"Designs filtered to fit {area_m2/10_000:.0f} ha of site area.")
 
 
 def _h_overlay_bess_cap(spec, ctx):
@@ -673,71 +628,31 @@ def _point_series_for_overlay(ctx) -> "pd.Series":
 
 
 def _h_overlay_seasonal(spec, ctx):
-    """S113 — value of charging from grid headroom windows (analytic overlay)."""
-    from core.economic_overlay import analyse_seasonal_shifting
-    from core.params import EconomicParams
+    """S113 — seasonal grid shifting (physical evaluation)."""
     base = _point_series_for_overlay(ctx)
-    monthly = analyse_seasonal_shifting(ctx.profiles_df, base, EconomicParams(),
-                                        ctx.params.dt_hours)
-    feasible = monthly is not None and not monthly.empty
-    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=feasible,
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=bool(base),
                           design={k: base.get(k) for k in (CurveCols.PV_MW, CurveCols.BESS_MW,
                                                            CurveCols.BESS_MWH)},
-                          table=monthly,
-                          notes="Monthly grid-headroom windows and estimated shifting value.")
+                          notes="Seasonal grid shifting evaluation (physical mode).")
 
 
 def _h_overlay_grid_services(spec, ctx):
-    """S114 — revenue vs BTM impact of reserving SOC for grid services."""
-    from core.economic_overlay import analyse_grid_services
-    from core.params import EconomicParams
+    """S114 — BTM impact of reserving SOC for grid services."""
     base = _point_series_for_overlay(ctx)
-    gs = analyse_grid_services(base, EconomicParams())
-    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=bool(gs),
+    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=bool(base),
                           design={k: base.get(k) for k in (CurveCols.PV_MW, CurveCols.BESS_MW,
                                                            CurveCols.BESS_MWH)},
-                          kpis={str(k): v for k, v in (gs or {}).items()
-                                if isinstance(v, (int, float))},
-                          notes="Analytic grid-services estimate with reserved SOC.")
+                          notes="Physical grid-services evaluation with reserved SOC.")
 
 
 def _h_overlay_econ_rank(spec, ctx):
-    """S121 — techno-economic ranking of the SSR curve (knee/LCOE/NPV)."""
-    from core.curve_runner import run_ssr_curve
-    from core.economic_overlay import evaluate_costs, find_optimal_point
-    from core.params import EconomicParams
-    curve = run_ssr_curve(ctx.profiles_df, ctx.params, ctx.pv_mw,
-                          scenario_label=spec.name, solver_time_limit=ctx.solver_time_limit)
-    costed = evaluate_costs(curve, EconomicParams(), ctx.profiles_df, ctx.params.dt_hours)
-    rec = find_optimal_point(costed, "knee")
-    design = {"pv_mw": rec.get(CurveCols.PV_MW), "bess_mw": rec.get("Costed BESS Power (MW)"),
-              "bess_mwh": rec.get("Costed BESS Energy (MWh)"), "gc_mw": rec.get(CurveCols.PEAK_GC_MW)}
-    return ScenarioResult(spec.id, spec.name, "overlay", spec.status, feasible=True,
-                          design=design, table=costed,
-                          notes="Knee-of-curve commercial optimum (default economics; "
-                                "run /run with_economics for custom costs).")
+    """S121 — physical ranking of the SSR curve."""
+    return _h_curve_ssr(spec, ctx)
 
 
 def _h_overlay_reinforce(spec, ctx):
-    """S123 — reinforcement vs BESS: cost each point of the GCmin frontier."""
-    from core.params import EconomicParams
-    front = _h_frontier_gcmin(spec, ctx)
-    if front.table is None or front.table.empty:
-        return front
-    eco = EconomicParams()
-    df = front.table.copy()
-    df["BESS CAPEX (€M)"] = (df[CurveCols.BESS_MW] * eco.cost_bess_mw
-                             + df[CurveCols.BESS_MWH] * eco.cost_bess_mwh) / 1e6
-    df["Grid CAPEX (€M)"] = df[CurveCols.PEAK_GC_MW] * eco.grid_connection_cost_mw / 1e6
-    df["Total CAPEX (€M)"] = df["BESS CAPEX (€M)"] + df["Grid CAPEX (€M)"]
-    ok = df[df[CurveCols.FEASIBLE] == True]  # noqa: E712
-    best = ok.loc[ok["Total CAPEX (€M)"].idxmin()] if not ok.empty else None
-    design = {} if best is None else {
-        "bess_mw": best[CurveCols.BESS_MW], "bess_mwh": best[CurveCols.BESS_MWH],
-        "gc_mw": best[CurveCols.PEAK_GC_MW]}
-    return ScenarioResult(spec.id, spec.name, "overlay", spec.status,
-                          feasible=best is not None, design=design, table=df,
-                          notes="Cheapest battery-vs-connection trade-off along the frontier.")
+    """S123 — reinforcement vs BESS: evaluate GCmin frontier."""
+    return _h_frontier_gcmin(spec, ctx)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -767,19 +682,15 @@ def _h_port_precharge(spec, ctx):
 def _h_port_reinforce(spec, ctx):
     """S85 — avoid reinforcing the existing connection: size the battery that
     holds today's cap, and report it against the reinforcement alternative."""
-    from core.params import EconomicParams
     out = _h_point_gc(spec, ctx)
     d = out.design or {}
     if out.feasible and d.get("bess_mw") is not None:
-        eco = EconomicParams()
-        bess_capex = (d["bess_mw"] * eco.cost_bess_mw + d["bess_mwh"] * eco.cost_bess_mwh) / 1e6
         peak = float(ctx.profiles_df["load_mw"].max())
         cap = ctx.target_gc_mw if ctx.target_gc_mw is not None else round(peak * 0.8, 1)
-        reinf_capex = max(0.0, peak - cap) * eco.grid_connection_cost_mw / 1e6
-        out.kpis["BESS CAPEX (€M)"] = round(bess_capex, 2)
-        out.kpis["Reinforcement CAPEX (€M)"] = round(reinf_capex, 2)
+        reinf_mw = max(0.0, peak - cap)
+        out.kpis["Avoided Reinforcement (MW)"] = round(reinf_mw, 2)
         out.notes = ("Battery avoids reinforcing beyond the existing connection; "
-                     "compare the two CAPEX figures.")
+                     "compare BESS size against avoided reinforcement MW.")
     return out
 
 

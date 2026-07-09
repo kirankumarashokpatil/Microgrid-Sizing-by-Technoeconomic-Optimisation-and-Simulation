@@ -38,13 +38,6 @@ export const ssrRange = (inputs) =>
     body: JSON.stringify(inputs),
   }).then(handle);
 
-// Phase 2 — re-cost an already-sized curve with new CAPEX assumptions (no LP re-solve).
-export const overlayEconomics = (inputs) =>
-  fetch(`${BASE}/economics`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(inputs),
-  }).then(handle);
 
 export const getProfileSummary = (profilePath) => {
   const q = profilePath ? `?profile_path=${encodeURIComponent(profilePath)}` : "";
@@ -90,7 +83,7 @@ export const runDesign = (payload) =>
     body: JSON.stringify(payload),
   }).then(handle);
 
-// Split optimiser (Phase 3, sweep): the tool decides the cost-optimal solar/BESS
+// Split optimiser (Phase 1, sweep): the tool decides the physical optimal solar/BESS
 // split within the available land → { recommended, frontier, pv_ceiling_mw }.
 export const runOptimiseSplit = (payload) =>
   fetch(`${BASE}/optimise-split`, {
@@ -100,6 +93,33 @@ export const runOptimiseSplit = (payload) =>
   }).then(handle);
 
 // Download an .xlsx workbook of the current result (built server-side, no re-run).
+// Rolling-horizon dispatch (Model W): operate a fixed design under limited
+// foresight and get its KPIs alongside Model R — the value of a forecast.
+export const dispatchRolling = (payload) =>
+  fetch(`${BASE}/dispatch-rolling`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(handle);
+
+// Minimum grid connection a design can hold + sensitivity to the real levers
+// (battery size, PV size, grid-charging on/off).
+export const minGridConnection = (payload) =>
+  fetch(`${BASE}/min-grid-connection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(handle);
+
+// Battery sized to hit a target WITH vs WITHOUT grid-charging — what allowing
+// grid pre-charge saves in hardware (big for grid goals, nil for SSR).
+export const sizeTradeoff = (payload) =>
+  fetch(`${BASE}/size-tradeoff`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(handle);
+
 export async function exportXlsx(payload) {
   const res = await fetch(`${BASE}/export`, {
     method: "POST",

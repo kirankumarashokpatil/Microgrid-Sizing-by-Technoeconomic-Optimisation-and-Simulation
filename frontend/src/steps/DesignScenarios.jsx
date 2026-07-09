@@ -13,8 +13,9 @@ const STRIPE = {
   "Generation + BESS": "#2f8f5b",
 };
 
-export function DesignScenarios({ cfg, profile, summary }) {
-  const [data, setData] = useState(null);
+// `data`/`setData` are lifted to App so a completed assessment survives leaving
+// and returning to the Size step (and a page refresh).
+export function DesignScenarios({ cfg, profile, summary, data, setData }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -48,24 +49,23 @@ export function DesignScenarios({ cfg, profile, summary }) {
   return (
     <div className="card" style={{ borderColor: "var(--teal)", background: "var(--teal-light)" }}>
       <h3 style={{ color: "var(--teal-dark)" }}>
-        Battery decision — with vs without BESS
+        Quick Assessment — With vs. Without Battery Storage
         <span style={{ marginLeft: 8, fontSize: 10.5, fontWeight: 700, letterSpacing: ".04em",
           textTransform: "uppercase", color: "#15616d", background: "#fff",
           border: "1px solid #bcd6d9", borderRadius: 6, padding: "2px 7px", verticalAlign: "middle" }}>
-          Land-first · Phase 1
+          Instant Baseline Check
         </span>
       </h3>
       <div className="hint" style={{ color: "var(--teal-dark)", opacity: 0.85 }}>
-        One solve of the land &amp; demand you've set — DC peak <b>{fmt.mw(peakLoad)}</b>, solar <b>{fmt.mw(pvMw)}</b>
-        {windMw > 0 ? <> · wind <b>{fmt.mw(windMw)}</b></> : null} · target SSR <b>{targetSsr}%</b>
-        {landHa > 0 ? <> · land <b>{Math.round(landHa)} ha</b></> : null}. See what a battery buys before the full sweep.
+        Evaluate your <b>{fmt.mw(peakLoad)}</b> data centre running purely on solar &amp; grid versus adding energy storage to hit your <b>{targetSsr}%</b> green energy target
+        {landHa > 0 ? <> across <b>{Math.round(landHa)} ha</b> of land</> : null}.
       </div>
 
       <button className="btn primary" disabled={busy} onClick={run} style={{ marginTop: 4 }}>
-        {busy ? "Solving…" : "▶ Compare scenarios"}
+        {busy ? "Analyzing configurations…" : "▶ Run Quick Assessment"}
       </button>
 
-      {err && <div className="banner err" style={{ marginTop: 12 }}>Engine error: {err}</div>}
+      {err && <div className="banner err" style={{ marginTop: 12 }}>Simulation error: {err}</div>}
 
       {data && (
         <>
@@ -75,18 +75,24 @@ export function DesignScenarios({ cfg, profile, summary }) {
               <div key={s.label} style={{ background: "#fff", border: "1px solid var(--line)",
                 borderRadius: 12, borderTop: `3px solid ${STRIPE[s.label] || "#7a8794"}`, padding: 16 }}>
                 <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "-.01em" }}>{s.label}</div>
-                <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11.5,
-                              color: "#8a949b", marginBottom: 10 }}>{s.config}</div>
-                <KV k="Self-sufficiency" v={fmt.pct1(s.ssr_pct)} strong />
-                <KV k="Grid connection" v={fmt.mw(s.grid_peak_mw)} />
-                {s.curtailment_pct != null && <KV k="Curtailment" v={fmt.pct1(s.curtailment_pct)} />}
-                <KV k="BESS" v={s.bess_mw > 0 ? `${fmt.mw(s.bess_mw)} · ${fmt.mwh(s.bess_mwh)}` : "—"} />
-                {s.duration_h > 0 && <KV k="Duration" v={`${s.duration_h.toFixed(1)} h`} />}
+                <div style={{ fontSize: 12, color: "#64748b", marginBottom: 10 }}>{s.config}</div>
+                {s.feasible === false ? (
+                  <div style={{ marginTop: 8, fontSize: 12.5, color: "var(--red)", fontWeight: 600, lineHeight: 1.4 }}>
+                    ⚠ Infeasible at {targetSsr}% — the target can&apos;t be reached with this generation.
+                    Add solar / land or lower the target.
+                  </div>
+                ) : (<>
+                  <KV k="Green Energy / SSR" v={fmt.pct1(s.ssr_pct)} strong />
+                  <KV k="Peak Grid Import" v={fmt.mw(s.grid_peak_mw)} />
+                  {s.curtailment_pct != null && <KV k="Spilled Solar" v={fmt.pct1(s.curtailment_pct)} />}
+                  <KV k="Battery Storage" v={s.bess_mw > 0 ? `${fmt.mw(s.bess_mw)} · ${fmt.mwh(s.bess_mwh)}` : "—"} />
+                  {s.duration_h > 0 && <KV k="Storage Duration" v={`${s.duration_h.toFixed(1)} h`} />}
+                </>)}
               </div>
             ))}
           </div>
           <div className="subtle" style={{ marginTop: 10 }}>
-            When the battery doesn't pay, the last two columns converge — that convergence is itself the answer.
+            Comparing these baselines demonstrates how energy storage reduces peak grid import and captures solar surplus.
           </div>
         </>
       )}

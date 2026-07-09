@@ -35,17 +35,22 @@ export function dispatchPolicy(cfg) {
     mode,
     order: custom ? d.priority : DISPATCH_DEFAULT_ORDER[mode],
     allowGridCharge: d.allowGridCharge,   // null | true | false
+    model: d.model || "rule",             // "rule" (R) | "rolling" (W)
+    horizonH: d.horizonH ?? 24,           // rolling look-ahead window (h)
+    commitH: d.commitH ?? 1,              // committed block before re-optimising (h)
   };
 }
 
 // Read-only chip strip describing the active merit order + grid-charging state.
 export function DispatchPolicyBadge({ cfg }) {
-  const { custom, order, allowGridCharge } = dispatchPolicy(cfg);
+  const { custom, order, allowGridCharge, model, horizonH, commitH } = dispatchPolicy(cfg);
   const gc = allowGridCharge == null ? "auto" : (allowGridCharge ? "on" : "off");
+  const modelTxt = model === "rolling"
+    ? `rolling-horizon forecast (${horizonH}h/${commitH}h)` : "rule-based (no foresight)";
   return (
     <div className="card" style={{ marginTop: 0 }}>
       <h3>Dispatch policy <span style={{ fontWeight: 400, color: "#8a949b", fontSize: 13 }}>
-        — {custom ? "custom merit order" : "automatic (grid as last resort)"} · grid-charging {gc}</span></h3>
+        — {modelTxt} · {custom ? "custom merit order" : "automatic (grid as last resort)"} · grid-charging {gc}</span></h3>
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 6 }}>
         {order.map((a, i) => (
           <span key={a} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -55,6 +60,30 @@ export function DispatchPolicyBadge({ cfg }) {
           </span>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Shown on the compare / decision steps when the inputs have moved on since the
+// result was computed — so a lender pack is never read as current when it isn't.
+export function StaleBanner({ stale, go }) {
+  if (!stale) return null;
+  return (
+    <div className="banner warn" style={{ marginBottom: 14, display: "flex",
+      alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+      <span>⚠ Inputs have changed since this result was computed — the figures below are <b>stale</b>.</span>
+      <button className="btn small" onClick={() => go(3)}>← Re-run in Size</button>
+    </div>
+  );
+}
+
+// A friendly placeholder for a chart with no data yet — never a bare empty box.
+export function EmptyChart({ msg = "No data to plot yet.", h = 220 }) {
+  return (
+    <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center",
+      color: "#8a949b", fontSize: 13, textAlign: "center", padding: "0 24px",
+      border: "1px dashed var(--line2)", borderRadius: 8, background: "#fafbfb" }}>
+      {msg}
     </div>
   );
 }

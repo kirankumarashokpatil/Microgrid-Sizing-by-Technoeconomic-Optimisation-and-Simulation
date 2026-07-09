@@ -3,10 +3,9 @@ Parameters Module
 -----------------
 Defines all strongly-typed parameter containers used across the pipeline.
 
-Phase 1 uses PhysicalParams only (no prices, no CAPEX).
-Phase 2 additionally uses EconomicParams.
+Physical sizing uses PhysicalParams only (no prices, no CAPEX).
 
-SizingResult is the output of one LP solve — used in both phases.
+SizingResult is the output of one LP solve.
 """
 
 from __future__ import annotations
@@ -87,63 +86,6 @@ class PhysicalParams:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PHASE 2 — Economic Parameters (not used by Phase 1 sizing LP)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class EconomicParams:
-    """
-    All financial assumptions needed for Phase 2 techno-economic overlay.
-    These are read from the project config Excel workbook.
-    """
-    # CAPEX (€ per unit of capacity)
-    cost_pv_mw: float              = 700_000.0    # €/MW
-    cost_wind_mw: float            = 1_300_000.0  # €/MW (wind is opt-in; 0 nameplate ⇒ no cost)
-    cost_bess_mw: float            = 150_000.0    # €/MW
-    cost_bess_mwh: float           = 300_000.0    # €/MWh
-    grid_connection_cost_mw: float = 250_000.0    # €/MW
-
-    # OPEX
-    grid_cost_mwh: float           = 150.0        # €/MWh import price
-    fixed_opex_per_mwh_year: float = 8_000.0      # €/MWh/year BESS O&M
-
-    # BESS degradation
-    cycle_life: int                = 5000
-    replacement_cost_mwh: float   = 300_000.0     # €/MWh replacement
-    degradation_cost_mwh: float | None = None     # override if supplied directly
-
-    # Project finance
-    nominal_discount_rate_pct: float = 8.0
-    inflation_rate_pct: float        = 2.5
-    project_lifespan_years: float    = 20.0
-    off_take_tariff_mwh: float       = 0.0
-
-    # ── Derived Properties ────────────────────────────────────────────────
-    @property
-    def real_discount_rate(self) -> float:
-        return (
-            (1 + self.nominal_discount_rate_pct / 100.0)
-            / (1 + self.inflation_rate_pct / 100.0) - 1
-        ) * 100.0
-
-    @property
-    def pv_factor(self) -> float:
-        r = self.real_discount_rate / 100.0
-        if r <= 0:
-            return self.project_lifespan_years
-        return sum(1 / (1 + r) ** t for t in range(1, int(self.project_lifespan_years) + 1))
-
-    @property
-    def real_deg_cost(self) -> float:
-        if self.degradation_cost_mwh is not None:
-            return self.degradation_cost_mwh
-        dod = 0.8   # assume 80% DoD for degradation calculation
-        if self.cycle_life <= 0 or dod <= 0:
-            return 0.0
-        return self.replacement_cost_mwh / (self.cycle_life * dod)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Sizing Result — output of ONE LP solve (Phase 1 or Phase 2)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -174,9 +116,6 @@ class SizingResult:
     exported_mwh: float      = 0.0
     peak_export_mw: float    = 0.0
     feasible: bool           = True
-
-    # Phase 2 only — CAPEX (€M), populated after economic overlay
-    capex_m: float = 0.0
 
     # ── Legacy fields kept for backward compat with dispatch_engine / financials ──
     @property

@@ -4,20 +4,20 @@ A behind-the-meter (BTM) sizing and dispatch optimisation platform for data cent
 with on-site PV and BESS. A Pyomo + HiGHS linear-programming engine drives a two-phase
 method, exposed through a CLI, a FastAPI service, and a React decision-support UI.
 
-- **Phase 1** — sizes the BESS on physical constraints only (no economics) to produce
+- **Phase 1 (Sizing Curves)** — sizes the BESS on physical constraints only to produce
   objective feasibility curves (SSR, peak-shaving, PV+BESS surface).
-- **Phase 2** — overlays CAPEX/OPEX/degradation and alternative revenue to find the
-  techno-economic optimum (knee / LCOE / NPV) on those curves.
+- **Phase 3 (Land-First Split)** — sweeps solar across available land and sizes BESS to
+  find the optimal physical split and trade-off curves.
 
 ## Repository structure
 
 ```
 .
 ├── backend/                  # everything Python — the engine and its service
-│   ├── core/                 # the LP engine (sizing, dispatch rule, economics, resolver)
+│   ├── core/                 # the LP engine (sizing, dispatch rule, resolver)
 │   ├── api/                  # FastAPI service (main.py)
 │   ├── data/                 # input datasets (8760 profiles, BESS_Input)
-│   ├── main.py               # Phase 1 / Phase 2 command-line entry point
+│   ├── main.py               # command-line entry point
 │   └── requirements.txt      # engine + API dependencies
 ├── frontend/                 # React + Vite decision-support UI (6-step wizard)
 │   └── src/
@@ -71,18 +71,6 @@ python main.py --phase1 --profiles "data/8760_PV&Load Profiles.xlsx"
 - `--resample-15min` — solve at native 15-min resolution (errors on hourly data; peaks are never fabricated).
 
 Outputs: `Phase1_Sizing_Curves.xlsx` + interactive `plot_*.html`.
-
-### Phase 2 — techno-economic overlay
-
-```bash
-python main.py --phase2 --curves "Phase1_Sizing_Curves.xlsx" --verify-dispatch
-```
-
-- `--curves` — the Phase 1 output to cost.
-- `--verify-dispatch` — re-runs the chosen design through rolling-horizon dispatch.
-- `--cost-pv-mw`, `--cost-bess-mwh`, `--grid-price`, `--site-area`, … — economic overrides (`python main.py -h` for the full list).
-
-Outputs: `Phase2_TechnoEconomic.xlsx` (+ `Phase2_Dispatch_Verification.xlsx`).
 
 ## Scenario reports
 

@@ -637,12 +637,11 @@ function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onRemo
           </div>
           <div style={{flex:1,minWidth:0}}>
             <input defaultValue={selNode.name} key={selNode.id}
-              onBlur={e=>onRename(selNode.id, e.target.value)}
+              onBlur={e => { e.target.style.borderBottomColor = "transparent"; onRename(selNode.id, e.target.value); }}
               style={{width:"100%",border:"none",borderBottom:"2px solid transparent",
                       fontSize:14,fontWeight:700,color:"#2f3a41",background:"transparent",
                       outline:"none",padding:"1px 2px",transition:"border-color .15s"}}
-              onFocus={e=>e.target.style.borderBottomColor=color}
-              onBlur2={e=>e.target.style.borderBottomColor="transparent"}/>
+              onFocus={e=>e.target.style.borderBottomColor=color}/>
             <div style={{fontSize:11,color:"#94a3b8",marginTop:1}}>{m.label}</div>
           </div>
         </div>
@@ -820,7 +819,7 @@ function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onRemo
 }
 
 /* ─── Main component ─── */
-export default function FlowDesigner({ cfg, onTopoChange }) {
+export default function FlowDesigner({ cfg, onTopoChange, step, go }) {
   const canvasContainerRef = useRef();
   const [canvasSize, setCanvasSize] = useState({ w:820, h:480 });
   const [tool, setTool] = useState("pointer");
@@ -1024,6 +1023,7 @@ export default function FlowDesigner({ cfg, onTopoChange }) {
   }, [nodes,notify]);
 
   const handleCanvasClick = useCallback((e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
     if (pendingPlace && canvasContainerRef.current) {
       const rect = canvasContainerRef.current.getBoundingClientRect();
       addNodeAt(pendingPlace, e.clientX - rect.left, e.clientY - rect.top);
@@ -1046,18 +1046,26 @@ export default function FlowDesigner({ cfg, onTopoChange }) {
   return (
     <div style={{
       display:"flex",flexDirection:"column",
-      border:"1px solid #e2e8ea",borderRadius:12,
-      background:"#fff",overflow:"hidden",
-      boxShadow:"0 2px 12px rgba(0,0,0,0.06)",
-      marginTop:20,
+      width: "100%", height: "calc(100vh - 114px)", flex: 1,
+      background:"#f8fafc",overflow:"hidden",
+      position: "relative",
     }}>
       {/* ── Toolbar ── */}
       <div style={{
         display:"flex",alignItems:"center",
         borderBottom:"1px solid #e2e8ea",
         background:"#fff",flexShrink:0,flexWrap:"wrap",
-        minHeight:48,
+        minHeight:52,
       }}>
+        {/* Title Badge */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px", borderRight: "1px solid #e2e8ea", flexShrink: 0 }}>
+          <span style={{ fontSize: 18 }}>⚡</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800, color: "#0f172a", lineHeight: 1.1 }}>Network Topology Designer</div>
+            <div style={{ fontSize: 10.5, color: "#64748b", fontWeight: 500 }}>Step 3 · Energy Flows</div>
+          </div>
+        </div>
+
         {/* Tool selector */}
         <div style={{display:"flex",alignItems:"center",gap:2,padding:"6px 10px",
                      borderRight:"1px solid #e2e8ea",flexShrink:0}}>
@@ -1144,8 +1152,7 @@ export default function FlowDesigner({ cfg, onTopoChange }) {
         {/* Canvas */}
         <div ref={canvasContainerRef}
              style={{flex:1,overflow:"hidden",position:"relative",
-                     cursor:pendingPlace||tool==="connect"?"crosshair":"default"}}
-             onClick={pendingPlace?handleCanvasClick:undefined}>
+                     cursor:pendingPlace||tool==="connect"?"crosshair":"default"}}>
           <NetworkCanvas
             nodes={nodes} flows={flows}
             selectedId={selectedId}
@@ -1210,12 +1217,31 @@ export default function FlowDesigner({ cfg, onTopoChange }) {
         {sig.has_bess&&<StatusChip label="🔋 BESS"/>}
         {sig.grid_available&&<StatusChip label="⚡ Grid"/>}
         <StatusChip label={`🏭 ${sig.peak_load_mw} MW load`}/>
-        <div style={{marginLeft:"auto",color:"#94a3b8",fontSize:10.5}}>
+        <div style={{marginLeft:"auto",color:"#94a3b8",fontSize:10.5, display: "flex", alignItems: "center", gap: 14}}>
+          <span>
           {tool==="connect"
             ? "Click source → click target to connect"
             : pendingPlace
             ? `Click to place ${META[pendingPlace].label}`
             : "Click to select · Drag to reposition"}
+          </span>
+          {go && (
+            <button
+              type="button"
+              onClick={() => go(step + 1)}
+              style={{
+                background: "#15616d", color: "#fff",
+                padding: "8px 16px", fontSize: 13, fontWeight: 700,
+                borderRadius: 8, border: "none", cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 6,
+                whiteSpace: "nowrap",
+                boxShadow: "0 2px 6px rgba(21, 97, 109, 0.25)",
+              }}
+            >
+              <span>Continue → Strategy &amp; Goals</span>
+              <span>➔</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -74,11 +74,12 @@ def load_profiles(
     if not xlsx_path.exists():
         raise FileNotFoundError(f"Profile file not found: {xlsx_path}")
 
-    # ── Read raw (no header) to inspect all rows ──────────────────────────
+    # ── Single-pass read: load the whole sheet once and slice rows/cols ───
+    # Previously we called pd.read_excel twice (full raw + skiprows), which
+    # doubled I/O time. Now we read once and take what we need from each part.
     raw = pd.read_excel(xlsx_path, sheet_name=_SHEET_NAME, header=None)
 
-    # ── Extract nameplates from row 1 (0-indexed), which contains both
-    #    column headers and the nameplate values in the side columns ─────
+    # ── Extract nameplates from row 1 (0-indexed) ─────────────────────────
     nameplate_row = raw.iloc[_NAMEPLATE_ROW]
 
     if load_mw_nameplate is None:
@@ -95,8 +96,10 @@ def load_profiles(
             pv_mw_nameplate = 150.0
             print(f"   [profile_loader] Could not read PV nameplate — defaulting to {pv_mw_nameplate} MW")
 
-    # ── Read data rows — skip row 0 (blank) + row 1 (headers/nameplates) ─
-    data = pd.read_excel(xlsx_path, sheet_name=_SHEET_NAME, skiprows=_DATA_START_ROW, header=None)
+    # ── Slice data rows from the already-loaded raw frame ──────────────────
+    # Skip row 0 (blank) and row 1 (headers/nameplates) — same as the old
+    # skiprows=_DATA_START_ROW call, but reusing the data already in memory.
+    data = raw.iloc[_DATA_START_ROW:].reset_index(drop=True)
 
     df = pd.DataFrame()
     df["timestamp"] = pd.to_datetime(data.iloc[:, _COL_TIMESTAMP], errors="coerce")
@@ -245,10 +248,11 @@ def compute_annual_energy(df: pd.DataFrame, dt_hours: float = 1.0) -> dict:
     total_load_mwh   = df["load_mw"].sum() * dt_hours
     # Note: pv_pu is unitless; caller must multiply by pv_mw_nameplate for MWh
     return {
-        "total_load_mwh":   round(total_load_mwh, 1),
-        "peak_load_mw":     round(df["load_mw"].max(), 2),
-        "min_load_mw":      round(df["load_mw"].min(), 2),
-        "mean_load_mw":     round(df["load_mw"].mean(), 2),
-        "pv_capacity_factor": round(df["pv_pu"].mean(), 4),
-        "n_timesteps":      len(df),
+        "total_load_mwh":       round(total_load_mwh, 1),
+        "peak_load_mw":         round(df["load_mw"].max(), 2),
+        "min_load_mw":          round(df["load_mw"].min(), 2),
+        "mean_load_mw":         round(df["load_mw"].mean(), 2),
+        "pv_capacity_factor":   round(df["pv_pu"].mean(), 4) if "pv_pu" in df else 0.0,
+        "wind_capacity_factor": round(df["wind_pu"].mean(), 4) if "wind_pu" in df else 0.0,
+        "n_timesteps":          len(df),
     }

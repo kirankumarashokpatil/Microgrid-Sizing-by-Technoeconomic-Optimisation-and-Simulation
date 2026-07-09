@@ -7,8 +7,8 @@ import { ssrRange } from "../lib/api.js";
 import { fmt } from "../lib/svg.js";
 
 const TOPO_LABEL = {
-  btm: "Grid-connected BTM", backup: "Backup (no generation)",
-  off_grid: "Off-grid", standalone: "Standalone export",
+  btm: "Behind the Meter (Renewables + Grid)", backup: "Backup Storage (Grid + Battery)",
+  off_grid: "Off-Grid / Islanded (No Grid)", standalone: "Standalone Generation (Export Only)",
 };
 
 function Slider({ label, hint, value, min, max, onChange, color, suffix = "%" }) {
@@ -25,24 +25,21 @@ function Slider({ label, hint, value, min, max, onChange, color, suffix = "%" })
 }
 
 // BTM has three objectives, each with the given⇒single / absent⇒sweep pattern:
-//   SSR              target → S11,  sweep → S21
-//   Grid connection  target → S12,  sweep → S22,  "lowest achievable" → S51
-//   SSR + Grid       both targets  → S71 (co-optimise)
 function BtmObjective({ cfg, patch, range }) {
   const obj = cfg.btmObjective || "ssr";
-  const TABS = [["ssr", "Self-sufficiency"], ["gc", "Grid connection"], ["both", "SSR + Grid"]];
+  const TABS = [["ssr", "Green Energy / SSR"], ["gc", "Peak Grid Import"], ["both", "Green Energy + Grid Limit"]];
   // Feasible SSR band → slider bounds + a clamp so an impossible target isn't set.
   const lo = range?.ssr_min != null ? Math.max(0, Math.floor(range.ssr_min)) : 50;
   const hi = range?.ssr_max != null ? Math.min(100, Math.ceil(range.ssr_max)) : 99;
   const overshoot = cfg.ssrTarget != null && range?.ssr_max != null && cfg.ssrTarget > range.ssr_max;
   const bandNote = range === undefined
-    ? <span className="subtle"><span className="spinner" /> checking feasible SSR range…</span>
+    ? <span className="subtle"><span className="spinner" /> calculating achievable green energy range…</span>
     : range?.ssr_max != null
-      ? <>Feasible SSR for this system: <b>{fmt.pct1(range.ssr_min)} – {fmt.pct1(range.ssr_max)}</b> (no battery → max battery). Pick a target inside this band.</>
+      ? <>Achievable Green Energy (SSR): <b>{fmt.pct1(range.ssr_min)} – {fmt.pct1(range.ssr_max)}</b> (from no battery to maximum battery). Select a target within this range.</>
       : null;
   return (
     <div className="card" style={{ borderColor: "var(--red)", background: "var(--red-light)" }}>
-      <h3 style={{ color: "var(--red)" }}>What should the engine size for?</h3>
+      <h3 style={{ color: "var(--red)" }}>What is your primary design goal?</h3>
       <div className="tabs" style={{ marginBottom: 12 }}>
         {TABS.map(([k, lab]) => (
           <button key={k} className={obj === k ? "on" : ""}
@@ -53,13 +50,13 @@ function BtmObjective({ cfg, patch, range }) {
 
       {(obj === "ssr" || obj === "both") && (
         <div style={{ marginBottom: obj === "both" ? 16 : 0 }}>
-          <label className="fld">Self-sufficiency (SSR)</label>
+          <label className="fld">Green Energy Target (SSR %)</label>
           {bandNote && <div style={{ fontSize: 12.5, color: "var(--teal-dark)", margin: "0 0 8px" }}>{bandNote}</div>}
           {obj === "ssr" && (
             <label className="subtle" style={{ display: "block", margin: "2px 0 10px", cursor: "pointer", fontSize: 13 }}>
               <input type="checkbox" checked={cfg.ssrTarget == null}
                      onChange={(e) => patch({ ssrTarget: e.target.checked ? null : Math.min(95, hi) })} />{" "}
-              Sweep the full SSR curve (no fixed target)
+              Analyze full range of green energy performance (no fixed target)
             </label>
           )}
           {cfg.ssrTarget != null ? (
@@ -70,35 +67,35 @@ function BtmObjective({ cfg, patch, range }) {
                 <span className="ssrval" style={{ color: overshoot ? "var(--red)" : "var(--red)" }}>{cfg.ssrTarget}%</span>
               </div>
               {overshoot && <div className="banner warn" style={{ marginTop: 8 }}>
-                {cfg.ssrTarget}% exceeds the feasible max ({fmt.pct1(range.ssr_max)}). It will be infeasible — lower it, or enlarge the parcel in Step 2.</div>}
+                {cfg.ssrTarget}% exceeds the maximum achievable ({fmt.pct1(range.ssr_max)}). Lower your target or add more solar generation area in Step 1.</div>}
             </>
-          ) : <div className="subtle">Sweeps SSR from feasible min → max; recommends the knee design.</div>}
+          ) : <div className="subtle">Simulates all green energy levels from minimum to maximum; automatically recommends the optimal balance point.</div>}
         </div>
       )}
 
       {(obj === "gc" || obj === "both") && (
         <div>
-          <label className="fld">Grid connection</label>
+          <label className="fld">Peak Grid Import Limit (MW)</label>
           {obj === "gc" && (
             <label className="subtle" style={{ display: "block", margin: "2px 0 10px", cursor: "pointer", fontSize: 13 }}>
               <input type="checkbox" checked={cfg.gcTarget == null}
                      onChange={(e) => patch({ gcTarget: e.target.checked ? null : 30 })} />{" "}
-              Sweep the grid-connection curve (no fixed target)
+              Analyze full range of grid connection capacities (no fixed target)
             </label>
           )}
           {cfg.gcTarget != null ? (
             <div style={{ maxWidth: 220 }}>
               <input type="number" value={cfg.gcTarget} min={0} onChange={(e) => patch({ gcTarget: +e.target.value })} />
-              <div className="subtle" style={{ marginTop: 4 }}>Minimum BESS to hold grid import ≤ this (MW).</div>
+              <div className="subtle" style={{ marginTop: 4 }}>Minimum battery storage required to keep peak grid import ≤ this limit.</div>
             </div>
-          ) : <div className="subtle">Sweeps grid connection down to the lowest the battery can firm.</div>}
+          ) : <div className="subtle">Simulates grid connection limits down to the lowest peak import achievable with battery storage.</div>}
         </div>
       )}
 
       <div className="hint" style={{ color: "var(--red)", opacity: 0.8, marginTop: 12, marginBottom: 0 }}>
-        {obj === "ssr"  && "Size for a self-sufficiency covenant — grid connection is the residual output."}
-        {obj === "gc"   && "Size for a grid-connection limit — SSR is the residual output."}
-        {obj === "both" && "Co-optimise: hit the SSR covenant while staying within the grid-connection cap."}
+        {obj === "ssr"  && "Optimize equipment to meet your green energy target — required grid connection is calculated automatically."}
+        {obj === "gc"   && "Optimize equipment to fit within your grid connection limit — green energy self-sufficiency is calculated automatically."}
+        {obj === "both" && "Optimize equipment to meet your green energy target while staying within your grid connection limit."}
       </div>
     </div>
   );
@@ -138,16 +135,16 @@ export function StepObjective({ cfg, patch, profile, step, go }) {
       <div className="card" style={{ borderColor: "var(--orange)", background: "var(--orange-light)" }}>
         <h3 style={{ color: "var(--orange)" }}>Grid connection target</h3>
         <div className="hint" style={{ color: "var(--orange)", opacity: 0.85 }}>
-          No on-site generation — the battery firms a grid connection. Set a target MW, or let the engine find the lowest achievable.
+          No on-site solar generation — battery storage is used to minimize required grid connection. Set a target import limit, or let the simulation find the lowest achievable peak import.
         </div>
         <label className="subtle" style={{ display: "block", margin: "6px 0 10px", cursor: "pointer" }}>
           <input type="checkbox" checked={cfg.gcTarget == null}
                  onChange={(e) => patch({ gcTarget: e.target.checked ? null : 30 })} />{" "}
-          Find the lowest achievable grid connection
+          Find lowest achievable peak grid import
         </label>
         {cfg.gcTarget != null && (
           <div style={{ maxWidth: 220 }}>
-            <label className="fld">Target grid connection (MW)</label>
+            <label className="fld">Target peak grid import (MW)</label>
             <input type="number" value={cfg.gcTarget} min={0}
                    onChange={(e) => patch({ gcTarget: +e.target.value })} />
           </div>
@@ -158,20 +155,20 @@ export function StepObjective({ cfg, patch, profile, step, go }) {
 
   return (
     <>
-      <div className="pagehead"><h1>Step 3 — Objective</h1>
-        <p>The target that fits your system. Detected system type: <b>{TOPO_LABEL[derived] || derived}</b>.</p></div>
+      <div className="pagehead"><h1>Step 3 — Strategy &amp; Goals</h1>
+        <p>Set your green energy targets and grid import limits. Detected system layout: <b>{TOPO_LABEL[derived] || derived}</b>.</p></div>
 
       <div className="card" style={{ borderColor: "var(--teal)", background: "var(--teal-light)" }}>
-        <h3 style={{ color: "var(--teal-dark)" }}>Why this target?</h3>
+        <h3 style={{ color: "var(--teal-dark)" }}>Why this strategy?</h3>
         <div className="hint" style={{ color: "var(--teal-dark)", opacity: 0.85, marginBottom: 0 }}>
-          Your Step-2 energy design resolves to a <b>{TOPO_LABEL[derived] || derived}</b> system, so the meaningful objective is shown below.
-          {derived !== "btm" && " (Change the flow topology in Step 2 to switch objective — e.g. add a grid node for an SSR covenant.)"}
+          Your Step 1 site layout configures a <b>{TOPO_LABEL[derived] || derived}</b> system. The relevant strategy controls are shown below.
+          {derived !== "btm" && " (To change your available strategies, adjust your site layout in Step 1 — e.g., add a grid connection to enable green energy target tracking.)"}
         </div>
       </div>
 
       {objective[derived] || objective.btm}
 
-      <Nav go={go} step={step} nextLabel="Continue → Size" />
+      <Nav go={go} step={step} nextLabel="Continue → Equipment Sizing" />
     </>
   );
 }

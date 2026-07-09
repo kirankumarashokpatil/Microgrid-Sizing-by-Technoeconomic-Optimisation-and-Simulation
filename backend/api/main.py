@@ -32,8 +32,10 @@ import io
 import math
 import os
 import tempfile
+import threading
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -51,12 +53,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from core.params import PhysicalParams, EconomicParams       # noqa: E402
+from core.params import PhysicalParams                       # noqa: E402
 from core.profile_loader import (                            # noqa: E402
     load_profiles, load_bess_input, compute_annual_energy,
-)
-from core.economic_overlay import (                          # noqa: E402
-    evaluate_costs, find_optimal_point,
 )
 from core.resolver import resolve_scenario                   # noqa: E402
 from core.site import parcel_capacity, area_for_capacity, _SOLAR_MW_PER_HA  # noqa: E402
@@ -170,25 +169,7 @@ class RunRequest(BaseModel):
     # Tri-state grid-charging: null ⇒ infer from objective; true/false ⇒ force it.
     allow_grid_charge: Optional[bool] = None
 
-    # ── Economics (Phase-2 overlay). When `with_economics` is true and the run
-    #    produces a sizing curve/point, the response gains an `economics` block:
-    #    per-point CAPEX/OPEX/NPV/LCOE, a recommended design, and savings vs a
-    #    100%-grid baseline. Defaults mirror EconomicParams. ──────────────────
-    with_economics: bool = False
-    economic_objective: str = "knee"       # knee | min_cost | lcoe | capex | ssr
-    cost_pv_mw: float = 700_000.0
-    cost_wind_mw: float = 1_300_000.0
-    cost_bess_mw: float = 150_000.0
-    cost_bess_mwh: float = 300_000.0
-    grid_connection_cost_mw: float = 250_000.0
-    grid_cost_mwh: float = 150.0
-    fixed_opex_per_mwh_year: float = 8_000.0
-    cycle_life: int = 5000
-    replacement_cost_mwh: float = 300_000.0
-    nominal_discount_rate_pct: float = 8.0
-    inflation_rate_pct: float = 2.5
-    project_lifespan_years: float = 20.0
-    off_take_tariff_mwh: float = 0.0
+
 
 
 class ResolveRequest(BaseModel):
@@ -295,184 +276,8 @@ def _df_to_records(df: Optional[pd.DataFrame], max_rows: int = 2000) -> Optional
     return {"columns": cols, "rows": rows, "n_total": int(len(df)), "truncated": truncated}
 
 
-def _eco_from_request(req: "RunRequest") -> EconomicParams:
-    """Build the engine's EconomicParams from the request's economic fields."""
-    return EconomicParams(
-        cost_pv_mw=req.cost_pv_mw,
-        cost_wind_mw=req.cost_wind_mw,
-        cost_bess_mw=req.cost_bess_mw,
-        cost_bess_mwh=req.cost_bess_mwh,
-        grid_connection_cost_mw=req.grid_connection_cost_mw,
-        grid_cost_mwh=req.grid_cost_mwh,
-        fixed_opex_per_mwh_year=req.fixed_opex_per_mwh_year,
-        cycle_life=req.cycle_life,
-        replacement_cost_mwh=req.replacement_cost_mwh,
-        nominal_discount_rate_pct=req.nominal_discount_rate_pct,
-        inflation_rate_pct=req.inflation_rate_pct,
-        project_lifespan_years=req.project_lifespan_years,
-        off_take_tariff_mwh=req.off_take_tariff_mwh,
-    )
 
 
-def _point_to_curve_df(result) -> Optional[pd.DataFrame]:
-    """Synthesize a one-row CurveCols frame from a point/forward_eval result so
-    the same economics overlay that costs curves can also cost a single design."""
-    d = result.design or {}
-    k = result.kpis or {}
-    if not d:
-        return None
-    row = {
-        CurveCols.SCENARIO:         result.id,
-        CurveCols.PV_MW:            d.get("pv_mw", 0.0) or 0.0,
-        CurveCols.BESS_MW:          d.get("bess_mw", 0.0) or 0.0,
-        CurveCols.BESS_MWH:         d.get("bess_mwh", 0.0) or 0.0,
-        CurveCols.PEAK_GC_MW:       d.get("gc_mw", k.get(KpiKeys.GCMIN_PEAK, 0.0)) or 0.0,
-        CurveCols.ACHIEVED_SSR_PCT: k.get(KpiKeys.SSR, 0.0) or 0.0,
-        CurveCols.OP_SSR_PCT:       k.get(KpiKeys.SSR, 0.0) or 0.0,
-        CurveCols.ACHIEVED_SCR_PCT: k.get(KpiKeys.SCR, 0.0) or 0.0,
-        CurveCols.FEASIBLE:         bool(result.feasible),
-    }
-    return pd.DataFrame([row])
-
-
-def _simple_irr(capex: float, annual_benefit: float, years: int) -> Optional[float]:
-    """IRR of an even-cashflow project: [-capex, +benefit × years]. Returns the
-    rate as a percentage, or None when there is no sign change (no solution).
-    Honest about its assumption — a flat annual benefit, not a year-by-year model."""
-    if capex <= 0 or annual_benefit <= 0:
-        return None
-    def npv(r):
-        return -capex + sum(annual_benefit / (1 + r) ** t for t in range(1, years + 1))
-    lo, hi = -0.9, 5.0
-    if npv(lo) < 0 and npv(hi) < 0:
-        return None
-    for _ in range(200):
-        mid = (lo + hi) / 2
-        v = npv(mid)
-        if abs(v) < 1.0:
-            break
-        if v > 0:
-            lo = mid
-        else:
-            hi = mid
-    return round(mid * 100.0, 2)
-
-
-def _attach_economics(result, req: "RunRequest", profiles_df: pd.DataFrame,
-                      dt_hours: float, solar_mw: Optional[float] = None,
-                      wind_mw: float = 0.0) -> Optional[dict]:
-    """Overlay Phase-2 economics on a run result (Phase 1 output). Thin wrapper that
-    picks the curve/point frame, then hands off to _economics_block."""
-    eco = _eco_from_request(req)
-    curve = result.table
-    is_point = curve is None or curve.empty
-    if is_point:
-        curve = _point_to_curve_df(result)
-    if curve is None or curve.empty or CurveCols.BESS_MWH not in curve.columns:
-        return None
-    return _economics_block(curve, eco, profiles_df, dt_hours, req.economic_objective,
-                            solar_mw=solar_mw, wind_mw=wind_mw, is_point=is_point)
-
-
-def _economics_block(curve, eco, profiles_df: pd.DataFrame, dt_hours: float,
-                     objective: str, solar_mw: Optional[float] = None,
-                     wind_mw: float = 0.0, is_point: bool = False) -> Optional[dict]:
-    """The Phase-2 costing itself: cost every point of a sizing curve, pick the
-    recommended one, and compute value vs a 100%-grid baseline. No LP re-solve —
-    this is a fast overlay on an already-sized curve. All numbers come from
-    core.economic_overlay; savings/IRR are stated against the grid baseline."""
-    if curve is None or curve.empty or CurveCols.BESS_MWH not in curve.columns:
-        return None
-
-    # When wind is used, the engine sized against a COMBINED generation profile, so
-    # its PV_MW column is the combined nameplate. For COSTING, substitute the true
-    # fixed solar/wind nameplates so each is priced at its own rate (PV here is a
-    # fixed input, so overriding the column is safe).
-    if wind_mw and wind_mw > 0:
-        curve = curve.copy()
-        if solar_mw is not None:
-            curve[CurveCols.PV_MW] = solar_mw
-        curve[CurveCols.WIND_MW] = wind_mw
-
-    costed = evaluate_costs(curve, eco, profiles_df, dt_hours)
-    if costed is None or costed.empty:
-        return None
-
-    rec = find_optimal_point(costed, objective=objective)
-    if rec is None or rec.empty:
-        return None
-
-    # 2. Baseline: 100% grid import, grid connection sized to peak load.
-    total_demand_mwh = float(profiles_df["load_mw"].sum() * dt_hours)
-    peak_load_mw     = float(profiles_df["load_mw"].max())
-    base_grid_cost   = total_demand_mwh * eco.grid_cost_mwh                  # €/yr
-    base_grid_conn   = peak_load_mw * eco.grid_connection_cost_mw            # € capex
-
-    # 3. Pull the recommended design's economics (already in € and €M).
-    g = lambda key, default=0.0: float(rec.get(key, default) or 0.0)
-    total_capex   = g("Total CAPEX (€M)") * 1e6
-    annual_opex   = g("Total Annual OPEX (€M/yr)") * 1e6
-    annual_grid   = g("Annual Grid Cost (€M/yr)") * 1e6
-    rec_gc_mw     = g(CurveCols.PEAK_GC_MW)
-
-    annual_savings   = max(0.0, base_grid_cost - annual_opex)               # vs 100%-grid opex
-    avoided_grid_conn = max(0.0, (peak_load_mw - rec_gc_mw) * eco.grid_connection_cost_mw)
-    payback_years    = round(total_capex / annual_savings, 1) if annual_savings > 0 else None
-    irr_pct          = _simple_irr(total_capex, annual_savings, int(eco.project_lifespan_years))
-    npv_savings      = -total_capex + annual_savings * eco.pv_factor        # NPV of the saving stream
-
-    def _ssr(row):
-        v = row.get(CurveCols.OP_SSR_PCT, None)
-        if v is None or pd.isna(v):
-            v = row.get(CurveCols.ACHIEVED_SSR_PCT, 0.0)
-        return _clean(v)
-
-    # 4. Per-point list for the frontier/comparison views.
-    points = [{
-        "ssr_pct":   _ssr(r),
-        "gc_mw":     _clean(r.get(CurveCols.PEAK_GC_MW, 0.0)),
-        "pv_mw":     _clean(r.get(CurveCols.PV_MW, 0.0)),
-        "bess_mw":   _clean(r.get("Costed BESS Power (MW)", r.get(CurveCols.BESS_MW, 0.0))),
-        "bess_mwh":  _clean(r.get("Costed BESS Energy (MWh)", r.get(CurveCols.BESS_MWH, 0.0))),
-        "capex_m":   _clean(r.get("Total CAPEX (€M)", 0.0)),
-        "opex_m_yr": _clean(r.get("Total Annual OPEX (€M/yr)", 0.0)),
-        "lcoe":      _clean(r.get("LCOE (€/MWh)", 0.0)),
-        "npv_cost_m":_clean(r.get("NPV Costs (€M)", 0.0)),
-    } for _, r in costed.iterrows()]
-
-    return _clean_dict({
-        "objective":          objective,
-        "is_point":           is_point,
-        "recommended": _clean_dict({
-            "ssr_pct":   _ssr(rec),
-            "scr_pct":   rec.get(CurveCols.ACHIEVED_SCR_PCT, None),
-            "gc_mw":     rec_gc_mw,
-            "pv_mw":     rec.get(CurveCols.PV_MW, 0.0),
-            "wind_mw":   wind_mw,
-            "bess_mw":   rec.get("Costed BESS Power (MW)", rec.get(CurveCols.BESS_MW, 0.0)),
-            "bess_mwh":  rec.get("Costed BESS Energy (MWh)", rec.get(CurveCols.BESS_MWH, 0.0)),
-            "capex_m":          total_capex / 1e6,
-            "capex_pv_m":       g("CAPEX PV (€M)"),
-            "capex_wind_m":     g("CAPEX Wind (€M)"),
-            "capex_bess_mw_m":  g("CAPEX BESS MW (€M)"),
-            "capex_bess_mwh_m": g("CAPEX BESS MWh (€M)"),
-            "capex_grid_m":     g("CAPEX Grid Connection (€M)"),
-            "opex_m_yr":        annual_opex / 1e6,
-            "lcoe":             g("LCOE (€/MWh)"),
-            "npv_cost_m":       g("NPV Costs (€M)"),
-        }),
-        "vs_grid_default": _clean_dict({
-            "baseline_grid_conn_mw":   peak_load_mw,
-            "baseline_annual_cost_m":  base_grid_cost / 1e6,
-            "baseline_grid_conn_capex_m": base_grid_conn / 1e6,
-            "annual_savings_m":        annual_savings / 1e6,
-            "avoided_grid_conn_m":     avoided_grid_conn / 1e6,
-            "payback_years":           payback_years,
-            "irr_pct":                 irr_pct,
-            "npv_savings_m":           npv_savings / 1e6,
-        }),
-        "points": points,
-    })
 
 
 def _result_to_json(result) -> dict:
@@ -494,14 +299,41 @@ def _result_to_json(result) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# App
+# App — startup warms the profile cache so the first real request is instant.
+# The Excel read (~2 s cold) happens in a daemon thread during server boot,
+# not on the first user click. Multi-worker: run with --workers 2 so a slow
+# LP solve on one worker never blocks /health or /profile-summary on another.
 # ──────────────────────────────────────────────────────────────────────────────
+
+_cache_ready = threading.Event()   # set when the default profile is warm
+
+
+def _warm_default_profile() -> None:
+    """Pre-load the bundled Excel into lru_cache.  Runs in a daemon thread at
+    startup so the first real API call finds the data already in memory."""
+    try:
+        _load_profile(str(_DEFAULT_PROFILE))
+        print("[startup] Default profile cached ✓")
+    except Exception as exc:
+        print(f"[startup] Profile warm-up failed (non-fatal): {exc}")
+    finally:
+        _cache_ready.set()
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    t = threading.Thread(target=_warm_default_profile, daemon=True, name="profile-warmer")
+    t.start()
+    yield
+    # nothing to tear down
+
 
 app = FastAPI(
     title="Scenario Engine API",
     description="The kitchen window over the DIP sizing optimiser. "
                 "Any front end (Streamlit today, React later) calls these URLs.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # Allow a browser front end (Streamlit / React on another port) to call us.
@@ -513,8 +345,13 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict:
-    """Quick check that the server is up and the default dataset is present."""
-    return {"status": "ok", "default_profile_exists": _DEFAULT_PROFILE.exists()}
+    """Always-fast liveness check — never touches the LP or the Excel file.
+    `profile_cached` tells the UI whether profile data is ready to serve."""
+    return {
+        "status": "ok",
+        "default_profile_exists": _DEFAULT_PROFILE.exists(),
+        "profile_cached": _cache_ready.is_set(),
+    }
 
 
 @app.get("/coverage")
@@ -747,64 +584,7 @@ def ssr_range(req: SsrRangeRequest) -> dict:
                         "has_generation": eng_pv > 0})
 
 
-class EconomicsRequest(BaseModel):
-    """Phase-2 overlay inputs: the Phase-1 sized points + the economic assumptions.
-    Re-costs the curve WITHOUT re-solving the LP, so CAPEX tweaks are instant."""
-    points: list[dict] = Field(default_factory=list)   # from a prior run's economics.points
-    profile_path: Optional[str] = None
-    load_peak_mw: Optional[float] = None
-    solar_mw: Optional[float] = None
-    wind_mw: float = 0.0
-    economic_objective: str = "knee"
-    cost_pv_mw: float = 700_000.0
-    cost_wind_mw: float = 1_300_000.0
-    cost_bess_mw: float = 150_000.0
-    cost_bess_mwh: float = 300_000.0
-    grid_connection_cost_mw: float = 250_000.0
-    grid_cost_mwh: float = 150.0
-    fixed_opex_per_mwh_year: float = 8_000.0
-    cycle_life: int = 5000
-    replacement_cost_mwh: float = 300_000.0
-    nominal_discount_rate_pct: float = 8.0
-    inflation_rate_pct: float = 2.5
-    project_lifespan_years: float = 20.0
-    off_take_tariff_mwh: float = 0.0
 
-
-@app.post("/economics")
-def economics(req: EconomicsRequest) -> dict:
-    """Phase 2 — overlay economics on an already-sized curve. Fast (no LP re-solve):
-    the SIZE step runs the LP once, then this re-prices the curve every time the
-    CAPEX assumptions change and re-picks the recommended commercial design."""
-    if not req.points:
-        return {"economics": None}
-    rows = [{
-        CurveCols.SCENARIO:         "econ",
-        CurveCols.PV_MW:            float(p.get("pv_mw") or 0),
-        CurveCols.WIND_MW:          float(req.wind_mw or 0),
-        CurveCols.BESS_MW:          float(p.get("bess_mw") or 0),
-        CurveCols.BESS_MWH:         float(p.get("bess_mwh") or 0),
-        CurveCols.PEAK_GC_MW:       float(p.get("gc_mw") or 0),
-        CurveCols.ACHIEVED_SSR_PCT: float(p.get("ssr_pct") or 0),
-        CurveCols.OP_SSR_PCT:       float(p.get("ssr_pct") or 0),
-        CurveCols.ACHIEVED_SCR_PCT: float(p.get("scr_pct") or 0),
-        CurveCols.FEASIBLE:         True,
-    } for p in req.points]
-    curve = pd.DataFrame(rows)
-    eco = _eco_from_request(req)   # duck-typed: same cost field names as RunRequest
-
-    path = req.profile_path or str(_DEFAULT_PROFILE)
-    if not Path(path).exists():
-        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
-    df, load_np, pv_np, dt_hours = _load_profile(path)
-    if req.load_peak_mw and req.load_peak_mw > 0:
-        cur = float(df["load_mw"].max())
-        if cur > 1e-9:
-            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
-
-    block = _economics_block(curve, eco, df, dt_hours, req.economic_objective,
-                             solar_mw=req.solar_mw, wind_mw=req.wind_mw, is_point=len(rows) == 1)
-    return {"economics": block}
 
 
 @app.post("/run")
@@ -874,8 +654,7 @@ def run(req: RunRequest) -> dict:
     #     nameplate is supplied and the dataset carries a wind profile, combine
     #     solar + wind here — generation = pv_pu×solar_mw + wind_pu×wind_mw —
     #     and feed the combined series as the engine's single "pv" generation.
-    #     The LP/dispatch core is unchanged. Solar/wind are kept separate for
-    #     economics so each is costed at its own rate.
+    #     The LP/dispatch core is unchanged.
     solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
     wind_mw  = float(req.wind_mw or 0.0)
     gen_df, eng_pv_mw, eff_wind_mw = df, solar_mw, 0.0
@@ -914,14 +693,422 @@ def run(req: RunRequest) -> dict:
     out = _result_to_json(result)
     out["dt_hours"] = dt_hours   # so the UI can scale energy (MW × dt = MWh)
 
-    # 6. Optional Phase-2 economics overlay (CAPEX/OPEX/NPV/LCOE + vs-grid savings).
-    if req.with_economics:
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rolling-horizon dispatch (Model W) — operate a fixed design under limited foresight
+# ──────────────────────────────────────────────────────────────────────────────
+class RollingDispatchRequest(BaseModel):
+    """Operate an already-sized design (PV + BESS) under rolling-horizon dispatch
+    (Model W) and return its KPIs + the Model-R comparison — the value of foresight
+    for the SAME battery. Inputs mirror /run so the front end reuses its config."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    pv_mw: Optional[float] = None
+    wind_mw: Optional[float] = None
+    bess_mw: float = 0.0
+    bess_mwh: float = 0.0
+    target_type: str = "ssr"                 # "ssr" | "peak_shaving"
+    site_topology: str = "grid_connected_btm"
+    site_max_grid_mw: float = 200.0
+    grid_ceiling_mw: Optional[float] = None  # defaults to site_max_grid_mw
+    horizon_h: float = 24.0
+    commit_h: float = 1.0
+    eff_charge: float = 0.95
+    eff_discharge: float = 0.95
+    min_soc_pct: float = 10.0
+    max_soc_pct: float = 90.0
+    initial_soc_pct: float = 50.0
+    allow_grid_charge: Optional[bool] = None
+    include_flows: bool = False              # return the full per-slot table too
+    # Optional deliverable-size comparison: minimum BESS to hit `target_value` under
+    # BOTH Model R and Model W. Factual — the two are typically similar (foresight's
+    # value is operational, not smaller hardware), so this is for transparency, not a
+    # "buy less" claim. target_value = SSR % (ssr) or grid ceiling MW (peak_shaving).
+    compare_sizes: bool = False
+    target_value: Optional[float] = None
+    duration_h: float = 4.0
+
+
+# A full-year W dispatch is ~8 s, so memoise the endpoint by its exact inputs: the
+# UI re-requests the same comparison whenever Step 6 re-renders or the user revisits.
+_ROLLING_CACHE: dict = {}
+_ROLLING_CACHE_MAX = 128
+
+
+@app.post("/dispatch-rolling")
+def dispatch_rolling(req: RollingDispatchRequest) -> dict:
+    """Run Model W (rolling horizon) on a fixed design and return KPIs for W and R
+    side by side, so a caller sees exactly what limited foresight buys."""
+    from core.rolling_dispatch import run_rolling_horizon_dispatch, size_under_rolling
+    from core.rule_dispatch import (
+        run_rule_dispatch, compute_flow_kpis, _mode_for, size_by_bisection,
+    )
+
+    # Cache hit? Identical inputs ⇒ identical result; skip the expensive re-solve.
+    _sig = tuple(sorted(req.model_dump().items(), key=lambda kv: kv[0]))
+    _hit = _ROLLING_CACHE.get(_sig)
+    if _hit is not None:
+        return _hit
+
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    if not Path(path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
+    df, load_np, pv_np, dt_hours = _load_profile(path)
+
+    # Same load-scaling + generation-combine as /run, so the design is comparable.
+    if req.load_peak_mw and req.load_peak_mw > 0:
+        cur = float(df["load_mw"].max())
+        if cur > 1e-9:
+            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+    solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
+    wind_mw  = float(req.wind_mw or 0.0)
+    eng_pv = solar_mw
+    if wind_mw > 0 and "wind_pu" in df.columns and float(df["wind_pu"].max()) > 1e-9:
+        comb = df["pv_pu"].to_numpy() * solar_mw + df["wind_pu"].to_numpy() * wind_mw
+        peak = float(comb.max())
+        if peak > 1e-9:
+            df = df.copy(); df["pv_pu"] = comb / peak; eng_pv = peak
+
+    ceiling = req.grid_ceiling_mw if req.grid_ceiling_mw is not None else req.site_max_grid_mw
+    params = PhysicalParams(
+        dt_hours=dt_hours, site_topology=req.site_topology, site_max_grid_mw=req.site_max_grid_mw,
+        eff_charge=req.eff_charge, eff_discharge=req.eff_discharge,
+        min_soc_pct=req.min_soc_pct, max_soc_pct=req.max_soc_pct,
+        initial_soc_pct=req.initial_soc_pct, allow_grid_charge=req.allow_grid_charge)
+
+    # Guard against a pathologically fine series × tiny commit (would hang the request).
+    H = max(1, round(req.horizon_h / dt_hours))
+    C = max(1, min(round(req.commit_h / dt_hours), H))
+    if (len(df) / C) * H > 2.0e6:
+        raise HTTPException(status_code=400, detail=(
+            f"Series too fine ({len(df)} steps) for horizon {req.horizon_h:g}h / "
+            f"commit {req.commit_h:g}h. Increase commit_h."))
+
+    mode = _mode_for(req.target_type)
+    grid_charge = req.allow_grid_charge if req.allow_grid_charge is not None else (mode == "peak_shaving")
+    try:
+        w_flows = run_rolling_horizon_dispatch(
+            df, params, pv_mw=eng_pv, bess_mw=req.bess_mw, bess_mwh=req.bess_mwh,
+            grid_ceiling_mw=ceiling, horizon_h=req.horizon_h, commit_h=req.commit_h,
+            allow_grid_charge=grid_charge)
+        r_flows = run_rule_dispatch(
+            df, params, pv_mw=eng_pv, bess_mw=req.bess_mw, bess_mwh=req.bess_mwh,
+            grid_ceiling_mw=ceiling, mode=mode, allow_grid_charge=grid_charge)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dispatch error: {exc}")
+
+    kW = compute_flow_kpis(w_flows, dt_hours)
+    kR = compute_flow_kpis(r_flows, dt_hours)
+    out = {
+        "dt_hours": dt_hours, "horizon_h": req.horizon_h, "commit_h": req.commit_h,
+        "grid_ceiling_mw": ceiling,
+        "model_w": _clean_dict(kW), "model_r": _clean_dict(kR),
+    }
+
+    # Optional deliverable-size comparison (min BESS to hit the target under each model).
+    if req.compare_sizes and req.target_value is not None:
         try:
-            out["economics"] = _attach_economics(result, req, df, dt_hours,
-                                                 solar_mw=solar_mw, wind_mw=eff_wind_mw)
-        except Exception as exc:   # economics must never sink a valid sizing run
-            out["economics"] = None
-            out["economics_error"] = str(exc)
+            rs = size_by_bisection(df, params, pv_mw=eng_pv, target_type=req.target_type,
+                                   target_value=req.target_value, duration_h=req.duration_h,
+                                   grid_ceiling_mw=(None if req.target_type == "peak_shaving" else ceiling))
+            ws = size_under_rolling(df, params, pv_mw=eng_pv, target_type=req.target_type,
+                                    target_value=req.target_value, duration_h=req.duration_h,
+                                    grid_ceiling_mw=(None if req.target_type == "peak_shaving" else ceiling),
+                                    horizon_h=req.horizon_h)
+            out["sizing"] = {
+                "target_type": req.target_type, "target_value": req.target_value,
+                "model_r": {"bess_mw": round(rs.bess_mw, 1), "bess_mwh": round(rs.bess_mwh, 1),
+                            "feasible": bool(rs.feasible)},
+                "model_w": {"bess_mw": round(ws.bess_mw, 1), "bess_mwh": round(ws.bess_mwh, 1),
+                            "feasible": bool(ws.feasible)},
+            }
+        except Exception:
+            pass   # sizing is advisory; never fail the operational comparison over it
+
+    if req.include_flows:
+        out["flows_w"] = _df_to_records(w_flows, max_rows=40000)
+
+    # Store in the bounded cache (clear wholesale when full — simple + safe).
+    if len(_ROLLING_CACHE) >= _ROLLING_CACHE_MAX:
+        _ROLLING_CACHE.clear()
+    _ROLLING_CACHE[_sig] = out
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Grid-connection minimiser — the smallest grid a design can hold + the real levers
+# ──────────────────────────────────────────────────────────────────────────────
+class MinGridRequest(BaseModel):
+    """For a FIXED design (PV + battery + demand), the minimum grid connection that
+    still serves all load (zero unmet), plus how that minimum moves with the levers
+    that actually matter: battery size, PV size, and grid-charging on/off.
+
+    Dispatch is Model R (causal peak-shaving) — verified to hit the perfect-foresight
+    floor for this metric, so the numbers are the true minimum, not a heuristic."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    pv_mw: Optional[float] = None
+    wind_mw: Optional[float] = None
+    bess_mw: float = 0.0
+    bess_mwh: float = 0.0
+    site_topology: str = "grid_connected_btm"
+    eff_charge: float = 0.95
+    eff_discharge: float = 0.95
+    min_soc_pct: float = 10.0
+    max_soc_pct: float = 90.0
+    initial_soc_pct: float = 50.0
+    sweep_points: int = 6                     # points per lever sweep (battery, PV)
+
+
+_MINGRID_CACHE: dict = {}
+
+
+def _min_grid_connection(df, params, *, pv_mw, bess_mw, bess_mwh, allow_grid_charge,
+                         iters: int = 18) -> float:
+    """Smallest grid ceiling (MW) that serves ALL load with this fixed design, found
+    by bisection on the ceiling under Model R peak-shaving. Zero unmet is the test."""
+    from core.rule_dispatch import run_rule_dispatch, compute_flow_kpis
+    peak = float(df["load_mw"].max())
+    lo, hi = 0.0, peak
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        f = run_rule_dispatch(df, params, pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
+                              grid_ceiling_mw=mid, mode="peak_shaving",
+                              allow_grid_charge=allow_grid_charge)
+        unmet = compute_flow_kpis(f, params.dt_hours)["Total Unmet Load (MWh)"]
+        if unmet <= 1e-3:
+            hi = mid
+        else:
+            lo = mid
+    return round(hi, 1)
+
+
+def _binding_shortage(df, params, *, pv_mw, bess_mw, bess_mwh, ceiling, allow_grid_charge) -> dict:
+    """At a given ceiling, characterise the LONGEST sustained above-ceiling stretch —
+    the constraint that sets the minimum grid connection. Returns its duration, the
+    energy above the connection (what the battery must cover), and the battery SOC
+    entering it (how full it managed to get). This is why the connection can't go
+    lower: an energy-limited shortage, not controller cleverness."""
+    from core.rule_dispatch import run_rule_dispatch
+    from core.schema import FlowCols
+    import numpy as np
+
+    dt = params.dt_hours
+    f = run_rule_dispatch(df, params, pv_mw=pv_mw, bess_mw=bess_mw, bess_mwh=bess_mwh,
+                          grid_ceiling_mw=ceiling, mode="peak_shaving",
+                          allow_grid_charge=allow_grid_charge)
+    load = df["load_mw"].to_numpy()
+    soc = f[FlowCols.SOC_MWH].to_numpy()
+    above = load > ceiling - 1e-6
+
+    runs, start = [], None
+    for i, a in enumerate(above):
+        if a and start is None:
+            start = i
+        elif not a and start is not None:
+            runs.append((start, i)); start = None
+    if start is not None:
+        runs.append((start, len(above)))
+    if not runs:
+        return {"hours": 0.0, "deficit_mwh": 0.0, "soc_entering_pct": None}
+
+    s, e = max(runs, key=lambda r: r[1] - r[0])
+    deficit = float(np.sum(load[s:e] - ceiling) * dt)
+    soc_max = bess_mwh * params.max_soc_pct / 100.0
+    soc_in = float(soc[s - 1]) if s > 0 else float(soc[0])
+    return {
+        "hours": round((e - s) * dt, 1),
+        "deficit_mwh": round(deficit, 1),
+        "soc_entering_pct": round(100.0 * soc_in / soc_max, 0) if soc_max > 1e-9 else None,
+    }
+
+
+def _grid_minimiser_report(df, params, *, pv_mw, bess_mw, bess_mwh, sweep_points=6) -> dict:
+    """The minimum grid connection a fixed design can hold + sensitivity to the real
+    levers (battery power, battery energy/duration, PV, grid-charging) + the binding
+    shortage. Shared by the /min-grid-connection endpoint and the Excel export so both
+    tell the identical story."""
+    peak_load = round(float(df["load_mw"].max()), 1)
+    duration = (bess_mwh / bess_mw) if bess_mw > 1e-9 else 5.0
+
+    def mg(pv, bmw, bmwh, gc):
+        return _min_grid_connection(df, params, pv_mw=pv, bess_mw=bmw, bess_mwh=bmwh,
+                                    allow_grid_charge=gc)
+
+    cur_off = mg(pv_mw, bess_mw, bess_mwh, False)
+    cur_on  = mg(pv_mw, bess_mw, bess_mwh, True)
+
+    n = max(3, min(int(sweep_points), 10))
+    # Battery power sweep (grid-charging ON, PV fixed): 0 → 2× the current power.
+    bmax = max(bess_mw * 2.0, bess_mw + 20.0, 40.0)
+    battery_sweep = [
+        {"bess_mw": round(b, 1), "bess_mwh": round(b * duration, 1),
+         "min_grid_mw": mg(pv_mw, b, b * duration, True)}
+        for b in (bmax * i / (n - 1) for i in range(n))
+    ]
+    # PV sweep (grid-charging ON, current battery): current → 2× (or up to a sensible cap).
+    pvmax = max(pv_mw * 2.0, pv_mw + 50.0, 100.0)
+    pv_sweep = [
+        {"pv_mw": round(p, 1), "min_grid_mw": mg(p, bess_mw, bess_mwh, True)}
+        for p in (pvmax * i / (n - 1) for i in range(n))
+    ]
+    # Battery ENERGY (duration) sweep — fix POWER, vary hours: the lever for a long
+    # sustained shortage. Only meaningful with a battery present; grid-charging ON.
+    duration_sweep = []
+    if bess_mw > 1e-6:
+        dmax = max(12.0, duration * 1.5)
+        durations = [2.0 + (dmax - 2.0) * i / (n - 1) for i in range(n)]
+        duration_sweep = [
+            {"duration_h": round(d, 1), "bess_mwh": round(bess_mw * d, 1),
+             "min_grid_mw": mg(pv_mw, bess_mw, bess_mw * d, True)}
+            for d in durations
+        ]
+
+    shortage = _binding_shortage(df, params, pv_mw=pv_mw, bess_mw=bess_mw,
+                                 bess_mwh=bess_mwh, ceiling=cur_on, allow_grid_charge=True)
+    return {
+        "no_battery_mw": peak_load,
+        "current": {
+            "pv_mw": round(pv_mw, 1), "bess_mw": round(bess_mw, 1),
+            "bess_mwh": round(bess_mwh, 1), "duration_h": round(duration, 1),
+            "min_grid_off": cur_off, "min_grid_on": cur_on,
+            "grid_charge_saving_mw": round(cur_off - cur_on, 1),
+        },
+        "battery_sweep": battery_sweep,
+        "duration_sweep": duration_sweep,
+        "pv_sweep": pv_sweep,
+        "binding_shortage": shortage,
+    }
+
+
+@app.post("/min-grid-connection")
+def min_grid_connection(req: MinGridRequest) -> dict:
+    """The minimum grid connection a design can hold + sensitivity to the real levers.
+    Returns the no-battery baseline, the current design's minimum (grid-charging off vs
+    on), battery/energy/PV sweeps, and the binding shortage."""
+    _sig = tuple(sorted(req.model_dump().items(), key=lambda kv: kv[0]))
+    hit = _MINGRID_CACHE.get(_sig)
+    if hit is not None:
+        return hit
+
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    if not Path(path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
+    df, load_np, pv_np, dt_hours = _load_profile(path)
+    if req.load_peak_mw and req.load_peak_mw > 0:
+        cur = float(df["load_mw"].max())
+        if cur > 1e-9:
+            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+    solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
+    wind_mw  = float(req.wind_mw or 0.0)
+    eng_pv = solar_mw
+    if wind_mw > 0 and "wind_pu" in df.columns and float(df["wind_pu"].max()) > 1e-9:
+        comb = df["pv_pu"].to_numpy() * solar_mw + df["wind_pu"].to_numpy() * wind_mw
+        peak = float(comb.max())
+        if peak > 1e-9:
+            df = df.copy(); df["pv_pu"] = comb / peak; eng_pv = peak
+
+    params = PhysicalParams(
+        dt_hours=dt_hours, site_topology=req.site_topology,
+        eff_charge=req.eff_charge, eff_discharge=req.eff_discharge,
+        min_soc_pct=req.min_soc_pct, max_soc_pct=req.max_soc_pct,
+        initial_soc_pct=req.initial_soc_pct)
+
+    out = _grid_minimiser_report(df, params, pv_mw=eng_pv, bess_mw=req.bess_mw,
+                                 bess_mwh=req.bess_mwh, sweep_points=req.sweep_points)
+    if len(_MINGRID_CACHE) >= 128:
+        _MINGRID_CACHE.clear()
+    _MINGRID_CACHE[_sig] = out
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Grid-charging trade-off — the battery the target needs WITH vs WITHOUT grid-charging
+# ──────────────────────────────────────────────────────────────────────────────
+class SizeTradeoffRequest(BaseModel):
+    """Size the battery to hit a target under BOTH grid-charging policies, so the user
+    sees what allowing grid pre-charge saves in hardware. Grid-charging lets a smaller
+    battery hold a grid connection (big saving for the grid objective); for a self-
+    sufficiency target it makes no difference (importing to charge lowers SSR)."""
+    profile_path: Optional[str] = None
+    load_peak_mw: Optional[float] = None
+    pv_mw: Optional[float] = None
+    wind_mw: Optional[float] = None
+    target_type: str = "ssr"                 # "ssr" | "peak_shaving"
+    target_value: float = 90.0               # SSR % (ssr) | grid ceiling MW (peak_shaving)
+    duration_h: float = 4.0
+    site_topology: str = "grid_connected_btm"
+    site_max_grid_mw: float = 200.0
+    site_max_bess_mw: float = 500.0
+    site_max_bess_mwh: float = 4000.0
+    eff_charge: float = 0.95
+    eff_discharge: float = 0.95
+    min_soc_pct: float = 10.0
+    max_soc_pct: float = 90.0
+    initial_soc_pct: float = 50.0
+
+
+_TRADEOFF_CACHE: dict = {}
+
+
+@app.post("/size-tradeoff")
+def size_tradeoff(req: SizeTradeoffRequest) -> dict:
+    """Battery sized to hit the target with grid-charging ON vs OFF + the saving."""
+    from core.rule_dispatch import size_by_bisection
+
+    _sig = tuple(sorted(req.model_dump().items(), key=lambda kv: kv[0]))
+    hit = _TRADEOFF_CACHE.get(_sig)
+    if hit is not None:
+        return hit
+
+    path = req.profile_path or str(_DEFAULT_PROFILE)
+    if not Path(path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile file not found: {path}")
+    df, load_np, pv_np, dt_hours = _load_profile(path)
+    if req.load_peak_mw and req.load_peak_mw > 0:
+        cur = float(df["load_mw"].max())
+        if cur > 1e-9:
+            df = df.copy(); df["load_mw"] = df["load_mw"] * (req.load_peak_mw / cur)
+    solar_mw = req.pv_mw if req.pv_mw is not None else pv_np
+    wind_mw  = float(req.wind_mw or 0.0)
+    eng_pv = solar_mw
+    if wind_mw > 0 and "wind_pu" in df.columns and float(df["wind_pu"].max()) > 1e-9:
+        comb = df["pv_pu"].to_numpy() * solar_mw + df["wind_pu"].to_numpy() * wind_mw
+        peak = float(comb.max())
+        if peak > 1e-9:
+            df = df.copy(); df["pv_pu"] = comb / peak; eng_pv = peak
+
+    def _size(gc: bool) -> dict:
+        params = PhysicalParams(
+            dt_hours=dt_hours, site_topology=req.site_topology,
+            site_max_grid_mw=req.site_max_grid_mw,
+            site_max_bess_mw=req.site_max_bess_mw, site_max_bess_mwh=req.site_max_bess_mwh,
+            eff_charge=req.eff_charge, eff_discharge=req.eff_discharge,
+            min_soc_pct=req.min_soc_pct, max_soc_pct=req.max_soc_pct,
+            initial_soc_pct=req.initial_soc_pct, allow_grid_charge=gc)
+        r = size_by_bisection(
+            df, params, pv_mw=eng_pv, target_type=req.target_type,
+            target_value=req.target_value, duration_h=req.duration_h,
+            grid_ceiling_mw=(None if req.target_type == "peak_shaving" else req.site_max_grid_mw))
+        return {"bess_mw": round(r.bess_mw, 1), "bess_mwh": round(r.bess_mwh, 1),
+                "feasible": bool(r.feasible)}
+
+    on, off = _size(True), _size(False)
+    saving_mw = round(off["bess_mw"] - on["bess_mw"], 1)
+    saving_mwh = round(off["bess_mwh"] - on["bess_mwh"], 1)
+    out = {
+        "target_type": req.target_type, "target_value": req.target_value,
+        "grid_charge_on": on, "grid_charge_off": off,
+        "saving_mw": saving_mw, "saving_mwh": saving_mwh,
+        # For SSR the two are equal (grid-charging hurts self-sufficiency); flag it so
+        # the UI can say "no effect for this objective — keep grid-charging off".
+        "matters": abs(saving_mw) > 0.5 or abs(saving_mwh) > 1.0,
+    }
+    if len(_TRADEOFF_CACHE) >= 128:
+        _TRADEOFF_CACHE.clear()
+    _TRADEOFF_CACHE[_sig] = out
     return out
 
 
@@ -942,7 +1129,7 @@ class DesignRequest(BaseModel):
     wind_mw: float = 0.0                        # allotted / built wind nameplate (MW)
     target_ssr_pct: float = 90.0               # self-sufficiency target for the BESS design
     site_topology: Optional[str] = "grid_connected_btm"
-    with_economics: bool = False
+
     available_land_ha: Optional[float] = None  # informational now; constrains later phases
 
 
@@ -957,8 +1144,6 @@ def _design_summary(label: str, config: str, out: dict, wind_mw: float) -> dict:
     """Normalise one /run result into a comparison row."""
     design = out.get("design") or {}
     kpis = out.get("kpis") or {}
-    econ = out.get("economics") if isinstance(out.get("economics"), dict) else None
-    rec = (econ or {}).get("recommended") or {}
     row = {
         "label": label, "config": config,
         "feasible": out.get("feasible"),
@@ -966,7 +1151,6 @@ def _design_summary(label: str, config: str, out: dict, wind_mw: float) -> dict:
         "pv_mw": design.get("pv_mw"), "wind_mw": wind_mw,
         "bess_mw": design.get("bess_mw"), "bess_mwh": design.get("bess_mwh"),
         "duration_h": design.get("duration_h"),
-        "capex_m": rec.get("capex_m") if isinstance(rec, dict) else None,
     }
     for out_key, kpi_key in _DESIGN_KPI.items():
         row[out_key] = kpis.get(kpi_key)
@@ -987,7 +1171,7 @@ def design(req: DesignRequest) -> dict:
             scenario_id=scenario_id, profile_path=req.profile_path,
             load_peak_mw=req.load_peak_mw, pv_mw=pv, wind_mw=wind,
             target_ssr_pct=req.target_ssr_pct, site_topology=req.site_topology,
-            with_economics=req.with_economics,
+
         ))
 
     scenarios = [
@@ -1024,15 +1208,7 @@ class OptimiseSplitRequest(BaseModel):
     wind_mw: float = 0.0                     # fixed wind nameplate (MW)
     steps: int = 8                           # sweep resolution (PV points)
     site_topology: Optional[str] = "grid_connected_btm"
-    # Cost inputs — mirror EconomicParams so the ranking matches the Phase-2 overlay.
-    cost_pv_mw: float = 700_000.0
-    cost_wind_mw: float = 1_300_000.0
-    cost_bess_mw: float = 150_000.0
-    cost_bess_mwh: float = 300_000.0
-    grid_connection_cost_mw: float = 250_000.0
-    grid_cost_mwh: float = 150.0
-    fixed_opex_per_mwh_year: float = 8_000.0
-    project_lifespan_years: float = 20.0
+
 
 
 @app.post("/optimise-split")
@@ -1075,26 +1251,40 @@ def optimise_split(req: OptimiseSplitRequest) -> dict:
         except Exception:
             results = [solve_ssr_point(*a) for a in args]   # fallback: sequential, never break
 
-    def _cost_row(r: dict) -> dict:
+    def _physical_row(r: dict) -> dict:
         pv = r["pv_mw"]; bess_mw = r["bess_mw"]; bess_mwh = r["bess_mwh"]
-        grid_mw = r["grid_mw"]; grid_import = r["grid_import_mwh"]
-        capex = (pv * req.cost_pv_mw + req.wind_mw * req.cost_wind_mw
-                 + bess_mw * req.cost_bess_mw + bess_mwh * req.cost_bess_mwh
-                 + grid_mw * req.grid_connection_cost_mw)
-        annual = grid_import * req.grid_cost_mwh + bess_mwh * req.fixed_opex_per_mwh_year
-        lifetime = capex + req.project_lifespan_years * annual
+        lp_grid = r["grid_mw"]; lp_ssr = r["ssr_pct"]
+        # Headline = operational (Model R, causal) truth when the rule verified this
+        # design; the LP (Model O) numbers are the optimistic bound, kept for context.
+        verified = r.get("op_ssr_pct") is not None
+        ssr  = r["op_ssr_pct"] if verified else lp_ssr
+        gc   = r["op_gc_mw"] if verified else lp_grid
+        scr  = r.get("op_scr_pct") if verified else r.get("scr_pct")
+        curt = r.get("op_curtailment_pct") if verified else r.get("curtailment_pct")
         return {
             "pv_mw": pv, "wind_mw": req.wind_mw,
             "pv_land_ha": round(pv / _SOLAR_MW_PER_HA, 1) if _SOLAR_MW_PER_HA else None,
             "bess_mw": round(bess_mw, 1), "bess_mwh": round(bess_mwh, 1),
-            "grid_mw": round(grid_mw, 2), "ssr_pct": round(r["ssr_pct"], 1),
-            "capex_m": round(capex / 1e6, 2),
-            "lifetime_cost_m": round(lifetime / 1e6, 2),
+            "duration_h": round(bess_mwh / bess_mw, 1) if bess_mw > 1e-9 else 0.0,
+            # grid_mw is the internal sort key; gc_mw is the app-wide name the UI reads.
+            "grid_mw": round(gc, 2), "gc_mw": round(gc, 2),
+            "ssr_pct": round(ssr, 1),
+            "scr_pct": round(scr, 1) if scr is not None else None,
+            "curtailment_pct": round(curt, 1) if curt is not None else None,
+            # Transparency: the optimistic LP bound and the cost of no foresight.
+            "verified": verified,
+            "lp_ssr_pct": round(lp_ssr, 1),
+            "lp_gc_mw": round(lp_grid, 2),
+            "ssr_gap_pp": round(lp_ssr - r["op_ssr_pct"], 1) if verified else None,
+            "unmet_mwh": round(r.get("op_unmet_mwh") or 0.0, 1) if verified else None,
         }
 
-    frontier = sorted((_cost_row(r) for r in results if r and r.get("feasible")),
+    frontier = sorted((_physical_row(r) for r in results if r and r.get("feasible")),
                       key=lambda x: x["pv_mw"])
-    best = min(frontier, key=lambda r: r["lifetime_cost_m"]) if frontier else None
+    # Recommend the split with the smallest grid connection. gc_mw is the honest
+    # (Model R) peak when verified, so the pick is ranked on the deliverable, not
+    # the optimistic LP bound.
+    best = min(frontier, key=lambda r: r["gc_mw"]) if frontier else None
     return {
         "inputs": {
             "available_land_ha": req.available_land_ha, "load_peak_mw": req.load_peak_mw,
@@ -1119,7 +1309,7 @@ class ExportRequest(BaseModel):
     scenario_id: str = ""
     scenario_name: str = ""
     recommended: dict = Field(default_factory=dict)
-    vs_grid_default: dict = Field(default_factory=dict)
+
     points: list[dict] = Field(default_factory=list)     # each: pv_mw,bess_mw,bess_mwh,ssr_pct,gc_mw,…
     kpis: dict = Field(default_factory=dict)
     assumptions: dict = Field(default_factory=dict)
@@ -1137,6 +1327,17 @@ class ExportRequest(BaseModel):
     initial_soc_pct: float = 50.0
     include_timeseries: bool = True
     max_point_sheets: int = 12               # cap per-point sheets so files stay sane
+    # "Everything in detail" mode: echo the raw input profiles, drop the per-point
+    # sheet cap, and add per-point KPIs, the SSR feasibility band, and an annual
+    # energy-balance reconciliation. Defaults on — the export is meant to be complete.
+    full_detail: bool = True
+    site_max_bess_mw: float = 500.0          # site BESS ceiling (for the SSR band)
+    site_max_bess_mwh: float = 4000.0
+    # Rolling-horizon dispatch (Model W): operate the recommended design under
+    # limited foresight and compare against Model R (the value of a forecast).
+    rolling_window: bool = True
+    rolling_horizon_h: float = 24.0          # look-ahead per window (hours)
+    rolling_commit_h: float = 1.0            # committed block before re-optimising
     # Dispatch policy (Model R) so the re-derived per-slot flows match the run.
     dispatch_priority: list[str] = Field(default_factory=list)
     allow_grid_charge: Optional[bool] = None
@@ -1174,8 +1375,6 @@ def export_xlsx(req: ExportRequest):
         }).to_excel(xw, sheet_name="Summary", index=False)
 
         rec = {**req.recommended}
-        if req.vs_grid_default:
-            rec.update({f"vs_grid: {k}": v for k, v in req.vs_grid_default.items()})
         if rec:
             _kv_sheet(rec).to_excel(xw, sheet_name="Recommended", index=False)
         if req.points:
@@ -1184,6 +1383,41 @@ def export_xlsx(req: ExportRequest):
             _kv_sheet(req.kpis).to_excel(xw, sheet_name="KPIs", index=False)
         if req.assumptions:
             _kv_sheet(req.assumptions).to_excel(xw, sheet_name="Assumptions", index=False)
+
+        # ── Definitions: make the workbook self-describing (every term + sheet). ──
+        if req.full_detail:
+            pd.DataFrame({
+                "Term": [
+                    "SSR (%)", "SCR (%)", "OSR / Curtailment (%)", "GCmin (MW)",
+                    "Model O", "Model W", "Model R", "PV → Load", "PV → BESS", "BESS → Load",
+                    "Grid → Load", "Unmet", "SOC (MWh)", "CHECK served = Load",
+                    "Sheet: Input Profiles", "Sheet: Run Parameters",
+                    "Sheet: SSR Feasibility Band", "Sheet: Per-point KPIs",
+                    "Sheet: Recommended dispatch", "Sheet: Annual Energy Balance",
+                ],
+                "Meaning": [
+                    "Self-Sufficiency Ratio — share of demand met by on-site PV+BESS (not grid).",
+                    "Self-Consumption Ratio — share of PV generation used on-site (vs curtailed).",
+                    "Curtailment — share of available PV spilled because it couldn't be used or stored.",
+                    "Minimum grid connection — the peak grid import the design still requires.",
+                    "Perfect-foresight LP (optimistic lower bound on the battery needed).",
+                    "Rolling-horizon dispatch — limited foresight (look ahead, commit, roll). Realistic operation, between O and R.",
+                    "Causal rule dispatch — no foresight, the buildable truth. All headline KPIs use Model R.",
+                    "PV serving load directly this timestep.",
+                    "Surplus PV charging the battery this timestep.",
+                    "Battery discharging to serve load this timestep.",
+                    "Grid import serving load this timestep.",
+                    "Load not served (should be 0 for a feasible design).",
+                    "Battery state of charge (energy) at each timestep.",
+                    "Reconciliation: PV→Load + BESS→Load + Grid→Load + Unmet must equal Load.",
+                    "The exact load/PV/wind series the run consumed (raw echo).",
+                    "Every parameter driving dispatch — reproduce any number from these.",
+                    "Achievable SSR from no battery (floor) to site-max battery (ceiling).",
+                    "All computed KPIs for every sized point on the curve.",
+                    "Full per-slot dispatch of the recommended design (Model R).",
+                    "Annual MWh split with a served-vs-load reconciliation check.",
+                ],
+            }).to_excel(xw, sheet_name="Definitions", index=False)
 
         # ── Per-point dispatch: forward-eval each sized point → per-slot sheet ──
         _prof = req.profile_path or str(_DEFAULT_PROFILE)   # default to bundled dataset
@@ -1212,23 +1446,226 @@ def export_xlsx(req: ExportRequest):
                     dispatch_priority=tuple(req.dispatch_priority or ()),
                     allow_grid_charge=req.allow_grid_charge)
 
-                splits = []
-                pts = [p for p in req.points if (p.get("bess_mwh") or 0) >= 0][: req.max_point_sheets]
+                # ── Run Parameters: EVERY value that drives the per-slot dispatch,
+                #    so a reader can reproduce every number in this workbook. ──
+                if req.full_detail:
+                    _order = list(req.dispatch_priority) or ["(engine default merit order)"]
+                    _kv_sheet({
+                        "Timestep dt (h)": dt_hours,
+                        "Topology": req.site_topology,
+                        "Grid ceiling (MW)": req.site_max_grid_mw,
+                        "Solar nameplate (MW)": round(float(solar_mw), 3),
+                        "Wind nameplate (MW)": round(wind_mw, 3),
+                        "Engine generation nameplate (MW)": round(float(eng_pv), 3),
+                        "Load scaled to peak (MW)": req.load_peak_mw or "(file default)",
+                        "Charge efficiency": req.eff_charge,
+                        "Discharge efficiency": req.eff_discharge,
+                        "Round-trip efficiency": round(req.eff_charge * req.eff_discharge, 4),
+                        "SOC min (%)": req.min_soc_pct,
+                        "SOC max (%)": req.max_soc_pct,
+                        "SOC initial (%)": req.initial_soc_pct,
+                        "Usable SOC window (%)": round(req.max_soc_pct - req.min_soc_pct, 1),
+                        "Site-max BESS power (MW)": req.site_max_bess_mw,
+                        "Site-max BESS energy (MWh)": req.site_max_bess_mwh,
+                        "Dispatch merit order": "  →  ".join(_order),
+                        "Grid-charging": ("auto (from objective)" if req.allow_grid_charge is None
+                                          else ("on" if req.allow_grid_charge else "off")),
+                        "Dispatch model": "Model R (causal, no foresight) — the buildable truth",
+                    }).to_excel(xw, sheet_name="Run Parameters", index=False)
+
+                # ── Raw input echo: the exact profiles the run consumed, so input
+                #    and results live in one file (full 8760 / 15-min series). ──
+                if req.full_detail:
+                    _wind_pu = (df["wind_pu"].to_numpy() if "wind_pu" in df.columns
+                                else [0.0] * len(df))
+                    input_echo = pd.DataFrame({
+                        "Timestamp": df["timestamp"].to_numpy(),
+                        "Load (MW)": df["load_mw"].round(4).to_numpy(),
+                        "PV (p.u.)": df["pv_pu"].round(6).to_numpy(),
+                        "PV available (MW)": (df["pv_pu"] * eng_pv).round(4).to_numpy(),
+                        "Wind (p.u.)": _wind_pu,
+                    })
+                    input_echo.to_excel(xw, sheet_name="Input Profiles", index=False)
+                    # Provenance + native resolution alongside the raw series.
+                    _kv_sheet({
+                        "Source file": Path(_prof).name,
+                        "Rows (timesteps)": len(df),
+                        "Native dt (h)": dt_hours,
+                        "Load peak (MW)": round(float(df["load_mw"].max()), 3),
+                        "Load energy (MWh/yr)": round(float(df["load_mw"].sum() * dt_hours), 1),
+                        "Solar nameplate used (MW)": round(float(eng_pv), 3),
+                        "Wind nameplate (MW)": round(wind_mw, 3),
+                        "Load scaled to peak (MW)": req.load_peak_mw or "(file default)",
+                    }).to_excel(xw, sheet_name="Input Summary", index=False)
+
+                # ── SSR feasibility band: what's achievable at this generation, from
+                #    no battery (PV-direct floor) to the site's max BESS (ceiling). ──
+                if req.full_detail:
+                    def _ssr_at(bmw, bmwh):
+                        k, _ = verify_sizing_with_rule(
+                            df, params, pv_mw=eng_pv, bess_mw=bmw, bess_mwh=bmwh,
+                            target_type="ssr", grid_ceiling_mw=req.site_max_grid_mw)
+                        return float(k.get(KpiKeys.SSR, 0.0) or 0.0)
+                    try:
+                        _kv_sheet({
+                            "SSR min — no BESS (%)": round(_ssr_at(0.0, 0.0), 1),
+                            "SSR max — site-max BESS (%)": round(
+                                _ssr_at(req.site_max_bess_mw, req.site_max_bess_mwh), 1),
+                            "Site-max BESS power (MW)": req.site_max_bess_mw,
+                            "Site-max BESS energy (MWh)": req.site_max_bess_mwh,
+                        }).to_excel(xw, sheet_name="SSR Feasibility Band", index=False)
+                    except Exception:
+                        pass
+
+                # Points may arrive keyed snake_case (pv_mw, …) or by the engine's
+                # curve column names ("BESS Power (MW)", …). Read either.
+                def _pget(p, *keys):
+                    for k in keys:
+                        v = p.get(k)
+                        if v is not None:
+                            return v
+                    return None
+
+                # Full detail ⇒ no per-point sheet cap; otherwise honour the cap.
+                cap = len(req.points) if req.full_detail else req.max_point_sheets
+                splits, point_kpis = [], []
+                last_flows = None
+                pts = [p for p in req.points
+                       if (_pget(p, "bess_mwh", CurveCols.BESS_MWH) or 0) >= 0][: cap]
                 for i, p in enumerate(pts):
-                    _k, flows = verify_sizing_with_rule(
+                    p_bess_mw  = float(_pget(p, "bess_mw", CurveCols.BESS_MW) or 0)
+                    p_bess_mwh = float(_pget(p, "bess_mwh", CurveCols.BESS_MWH) or 0)
+                    p_ssr      = _pget(p, "ssr_pct", CurveCols.ACHIEVED_SSR_PCT, CurveCols.OP_SSR_PCT)
+                    p_gc       = _pget(p, "gc_mw", CurveCols.PEAK_GC_MW, CurveCols.OP_PEAK_GC_MW) or 0
+                    k, flows = verify_sizing_with_rule(
                         df, params, pv_mw=eng_pv,
-                        bess_mw=float(p.get("bess_mw") or 0), bess_mwh=float(p.get("bess_mwh") or 0),
+                        bess_mw=p_bess_mw, bess_mwh=p_bess_mwh,
                         target_type="ssr", grid_ceiling_mw=req.site_max_grid_mw)
-                    tag = (f"SSR{round(float(p.get('ssr_pct')))}" if p.get("ssr_pct") is not None
-                           else f"GC{round(float(p.get('gc_mw', 0)))}")
+                    last_flows = flows
+                    tag = (f"SSR{round(float(p_ssr))}" if p_ssr is not None
+                           else f"GC{round(float(p_gc))}")
                     hourly_flows(flows).to_excel(xw, sheet_name=f"P{i+1}_{tag}"[:31], index=False)
                     splits.append({"Point": f"P{i+1} {tag}",
-                                   "BESS (MW)": p.get("bess_mw"), "BESS (MWh)": p.get("bess_mwh"),
+                                   "BESS (MW)": p_bess_mw, "BESS (MWh)": p_bess_mwh,
                                    **energy_split(flows, dt_hours)})
+                    # Every computed KPI for this point (SSR/SCR/GCmin/OSR/…).
+                    point_kpis.append({"Point": f"P{i+1} {tag}",
+                                       "BESS (MW)": p_bess_mw, "BESS (MWh)": p_bess_mwh,
+                                       **_clean_dict(k)})
                 if splits:
                     pd.DataFrame(splits).to_excel(xw, sheet_name="Per-point energy", index=False)
-                    # monthly breakdown of the recommended (last-ish / representative)
-                    monthly(flows, dt_hours).to_excel(xw, sheet_name="Monthly (last point)", index=False)
+                if point_kpis and req.full_detail:
+                    pd.DataFrame(point_kpis).to_excel(xw, sheet_name="Per-point KPIs", index=False)
+
+                # ── Recommended design: derive its OWN flows from req.recommended
+                #    (do NOT assume it is the last point processed). Falls back to the
+                #    last point only when no recommended design was supplied. ──
+                rec = req.recommended or {}
+                rec_flows = last_flows
+                if rec:
+                    rec_bess_mw  = float(_pget(rec, "bess_mw", CurveCols.BESS_MW) or 0)
+                    rec_bess_mwh = float(_pget(rec, "bess_mwh", CurveCols.BESS_MWH) or 0)
+                    _kr, rec_flows = verify_sizing_with_rule(
+                        df, params, pv_mw=eng_pv, bess_mw=rec_bess_mw, bess_mwh=rec_bess_mwh,
+                        target_type="ssr", grid_ceiling_mw=req.site_max_grid_mw)
+                if rec_flows is not None:
+                    if req.full_detail:
+                        # Full per-slot dispatch of the recommended design + its balance.
+                        hourly_flows(rec_flows).to_excel(xw, sheet_name="Recommended dispatch", index=False)
+                        bal = energy_split(rec_flows, dt_hours)
+                        served = (bal.get("PV → Load (MWh)", 0) + bal.get("BESS → Load (MWh)", 0)
+                                  + bal.get("Grid → Load (MWh)", 0))
+                        bal["Served (MWh)"] = round(served, 1)
+                        bal["Served + Unmet − Load (MWh)"] = round(
+                            served + bal.get("Unmet (MWh)", 0) - bal.get("Load (MWh)", 0), 1)
+                        _kv_sheet(bal).to_excel(xw, sheet_name="Annual Energy Balance", index=False)
+                    monthly(rec_flows, dt_hours).to_excel(xw, sheet_name="Monthly (recommended)", index=False)
+
+                    # ── Model W: rolling-horizon dispatch of the recommended design ──
+                    #    Operate the SAME battery under limited foresight and compare
+                    #    with Model R — the value a forecast-driven controller adds.
+                    #    Guarded by a work proxy so a fine-resolution year can't hang
+                    #    the request; skips with a note instead.
+                    if req.rolling_window and rec:
+                        try:
+                            from core.rolling_dispatch import run_rolling_horizon_dispatch
+                            from core.rule_dispatch import compute_flow_kpis
+                            H = max(1, round(req.rolling_horizon_h / dt_hours))
+                            C = max(1, min(round(req.rolling_commit_h / dt_hours), H))
+                            work = (len(df) / C) * H       # ≈ solves × window size
+                            if work > 2.0e6:
+                                _kv_sheet({"Model W skipped":
+                                    f"series too fine ({len(df)} steps) for horizon "
+                                    f"{req.rolling_horizon_h:g}h / commit {req.rolling_commit_h:g}h; "
+                                    "increase commit_h to enable."}).to_excel(
+                                    xw, sheet_name="Model W note", index=False)
+                            else:
+                                rec_bmw  = float(_pget(rec, "bess_mw", CurveCols.BESS_MW) or 0)
+                                rec_bmwh = float(_pget(rec, "bess_mwh", CurveCols.BESS_MWH) or 0)
+                                w_flows = run_rolling_horizon_dispatch(
+                                    df, params, pv_mw=eng_pv, bess_mw=rec_bmw, bess_mwh=rec_bmwh,
+                                    grid_ceiling_mw=req.site_max_grid_mw,
+                                    horizon_h=req.rolling_horizon_h, commit_h=req.rolling_commit_h,
+                                    allow_grid_charge=req.allow_grid_charge)
+                                kW = compute_flow_kpis(w_flows, dt_hours)
+                                kR = compute_flow_kpis(rec_flows, dt_hours)
+                                # Side-by-side R vs W on the same design.
+                                comp = pd.DataFrame({
+                                    "KPI": list(kR.keys()),
+                                    "Model R (no foresight)": [_clean(kR[k]) for k in kR],
+                                    "Model W (rolling horizon)": [_clean(kW.get(k)) for k in kR],
+                                })
+                                comp.to_excel(xw, sheet_name="Dispatch model comparison", index=False)
+                                _kv_sheet({
+                                    "Horizon (h)": req.rolling_horizon_h,
+                                    "Commit (h)": req.rolling_commit_h,
+                                    "Model": "W = limited foresight (between O=LP bound and R=causal)",
+                                }).to_excel(xw, sheet_name="Model W settings", index=False)
+                                if req.full_detail:
+                                    hourly_flows(w_flows).to_excel(
+                                        xw, sheet_name="Rolling dispatch (W)", index=False)
+                        except Exception as exc:
+                            _kv_sheet({"Model W error": str(exc)}).to_excel(
+                                xw, sheet_name="Model W note", index=False)
+
+                # ── Grid-connection minimiser: the smallest grid the recommended design
+                #    can hold + the levers that shrink it (battery power/energy, PV,
+                #    grid-charging) + the binding shortage. This is the "reduce the grid
+                #    connection" story in the lender pack, not just the UI. ──
+                if req.full_detail and rec and req.site_topology == "grid_connected_btm":
+                    try:
+                        gm_bmw  = float(_pget(rec, "bess_mw", CurveCols.BESS_MW) or 0)
+                        gm_bmwh = float(_pget(rec, "bess_mwh", CurveCols.BESS_MWH) or 0)
+                        rep = _grid_minimiser_report(df, params, pv_mw=eng_pv,
+                                                     bess_mw=gm_bmw, bess_mwh=gm_bmwh)
+                        cur = rep["current"]; sh = rep["binding_shortage"]
+                        _kv_sheet({
+                            "Peak demand — grid with no battery (MW)": rep["no_battery_mw"],
+                            "Minimum grid — grid-charging OFF (MW)": cur["min_grid_off"],
+                            "Minimum grid — grid-charging ON (MW)": cur["min_grid_on"],
+                            "Grid-charging saving (MW)": cur["grid_charge_saving_mw"],
+                            "Design PV (MW)": cur["pv_mw"],
+                            "Design BESS (MW / MWh / h)":
+                                f"{cur['bess_mw']} / {cur['bess_mwh']} / {cur['duration_h']}",
+                            "Binding shortage — duration (h)": sh["hours"],
+                            "Binding shortage — energy above connection (MWh)": sh["deficit_mwh"],
+                            "Binding shortage — battery SOC entering (%)": sh["soc_entering_pct"],
+                            "Note": "Model R hits the perfect-foresight floor for grid size; the "
+                                    "levers are battery power, battery energy (hours), PV and grid-charging.",
+                        }).to_excel(xw, sheet_name="Grid Connection", index=False)
+                        # Lever sweeps as one tidy long-format table (min grid per lever step).
+                        lever_rows = (
+                            [{"Lever": "Battery power", "Value": r["bess_mw"], "Unit": "MW",
+                              "Min grid (MW)": r["min_grid_mw"]} for r in rep["battery_sweep"]]
+                            + [{"Lever": "Battery duration", "Value": r["duration_h"], "Unit": "h",
+                                "Min grid (MW)": r["min_grid_mw"]} for r in rep["duration_sweep"]]
+                            + [{"Lever": "PV nameplate", "Value": r["pv_mw"], "Unit": "MW",
+                                "Min grid (MW)": r["min_grid_mw"]} for r in rep["pv_sweep"]]
+                        )
+                        pd.DataFrame(lever_rows).to_excel(xw, sheet_name="Grid levers", index=False)
+                    except Exception as exc:
+                        _kv_sheet({"Grid minimiser error": str(exc)}).to_excel(
+                            xw, sheet_name="Grid note", index=False)
             except Exception as exc:
                 _kv_sheet({"time-series error": str(exc)}).to_excel(xw, sheet_name="Dispatch note", index=False)
 

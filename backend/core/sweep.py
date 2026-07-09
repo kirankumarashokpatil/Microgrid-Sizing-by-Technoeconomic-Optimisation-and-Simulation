@@ -17,6 +17,8 @@ from functools import lru_cache
 from core.profile_loader import load_profiles, load_bess_input
 from core.params import PhysicalParams
 from core.sizing_engine import solve_sizing_point
+from core.rule_dispatch import verify_sizing_with_rule
+from core.schema import KpiKeys
 
 
 @lru_cache(maxsize=4)
@@ -67,12 +69,47 @@ def solve_ssr_point(path: str, load_peak_mw, pv_mw: float, wind_mw: float,
     # For a feasible BTM design unmet≈0, so grid import = (1 − SSR)·demand exactly.
     total_demand = float(df["load_mw"].sum()) * dt
     grid_import = max(0.0, (1.0 - r.achieved_ssr_pct / 100.0) * total_demand)
-    return {
+    # Curtailment from an energy balance on the generation bus, valid for ANY topology:
+    #   generation = self_consumed + exported + curtailed
+    # SCR = self_consumed / generation, so curtailed = generation·(1 − SCR) − exported.
+    # (df["pv_pu"] × eng_pv is the combined PV+wind series; export=0 ⇒ curtailment = 100 − SCR.)
+    total_generation = float(eng_pv) * float(df["pv_pu"].sum()) * dt
+    if total_generation > 1e-9:
+        self_consumed = (r.achieved_scr_pct / 100.0) * total_generation
+        curtailed_mwh = max(0.0, total_generation - self_consumed - float(r.exported_mwh or 0.0))
+        curtailment_pct = curtailed_mwh / total_generation * 100.0
+    else:
+        curtailment_pct = 0.0
+
+    out = {
+        # Model O — perfect-foresight LP: an optimistic lower bound.
         "pv_mw": solar_mw, "feasible": True,
         "bess_mw": r.bess_mw, "bess_mwh": r.bess_mwh,
         "grid_mw": r.peak_grid_mw, "ssr_pct": r.achieved_ssr_pct,
+        "scr_pct": r.achieved_scr_pct, "curtailment_pct": curtailment_pct,
         "grid_import_mwh": grid_import,
     }
+
+    # Model R — operate that exact battery under the causal contract rule (no
+    # foresight). This is the deliverable truth the rest of the tool reports; the
+    # LP size misses the target by the SSR gap. Only grid-connected BTM has causal
+    # grid semantics the rule models, so other topologies keep LP-only numbers.
+    if topology == "grid_connected_btm" and r.bess_mwh is not None:
+        try:
+            op_kpis, _ = verify_sizing_with_rule(
+                df, params, pv_mw=eng_pv, bess_mw=r.bess_mw, bess_mwh=r.bess_mwh,
+                target_type="ssr", grid_ceiling_mw=params.site_max_grid_mw,
+            )
+            out.update({
+                "op_ssr_pct":        float(op_kpis[KpiKeys.SSR]),
+                "op_scr_pct":        float(op_kpis[KpiKeys.SCR]),
+                "op_curtailment_pct": float(op_kpis[KpiKeys.OSR]),
+                "op_gc_mw":          float(op_kpis[KpiKeys.GCMIN_PEAK]),
+                "op_unmet_mwh":      float(op_kpis[KpiKeys.TOTAL_UNMET_LOAD]),
+            })
+        except Exception:
+            pass   # fall back to LP-only numbers if the rule pass fails
+    return out
 
 
 def solve_ssr_point_star(args: tuple) -> dict:
