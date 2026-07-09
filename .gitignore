@@ -38,6 +38,9 @@ archive/Phase1_Sizing_Curves.xlsx
 archive/Phase2_TechnoEconomic.xlsx
 archive/Phase2_Dispatch_Verification.xlsx
 
+# Workbook run outputs from run_workbook.py (the *input* .xlsx stay tracked)
+backend/*_out.xlsx
+
 # Per-scenario report outputs (regenerate via <name>/build.py); reports now archived
 backend/reports/**/*.xlsx
 backend/reports/**/*.html
