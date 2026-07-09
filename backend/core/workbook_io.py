@@ -120,6 +120,16 @@ FIELDS: list[dict] = [
          help="Hard grid ceiling threaded into firmness sizing. Blank ⇒ site max."),
     dict(key="deliverable_target", type="str", default="ssr", group="Objective",
          help="Which target the deliverable size must hit: ssr | gc."),
+    dict(key="sizing_basis", type="str", default="lp", group="Objective",
+         help="Sizing basis: lp (LP lower-bound), deliverable (causal-rule bisection), eol (deliverable + EoL gross-up)."),
+
+    # ── Land split (solar ↔ wind co-optimisation over ONE shared parcel) ──
+    dict(key="land_split", type="bool", default=False, group="Land split",
+         help="true ⇒ co-decide the solar/wind split of a shared land budget, per SSR. Overrides the normal scenario."),
+    dict(key="total_area_ha", type="float", default="", group="Land split",
+         help="Shared buildable land (ha) split between solar & wind. Blank ⇒ largest Parcels area."),
+    dict(key="land_split_objective", type="str", default="min_grid", group="Land split",
+         help="min_grid (least grid connection: lowest-grid design + grid↔battery trade-off) | min_bess (per-SSR frontier)."),
 
     # ── Topology & site limits ──
     dict(key="site_topology", type="str", default="", group="Topology & site limits",
@@ -530,6 +540,7 @@ def build_context(
         bess_mw=eff["bess_mw"], bess_mwh=eff["bess_mwh"],
         grid_ceiling_mw=eff["grid_ceiling_mw"],
         deliverable_target=eff["deliverable_target"],
+        sizing_basis=eff["sizing_basis"],
         pv_sweep_mw=tuple(eff["pv_sweep_mw"] or ()),
         ssr_targets_pct=tuple(eff["ssr_targets_pct"] or ()),
         solver_time_limit=eff["solver_time_limit"],
@@ -577,6 +588,12 @@ def run_workbook(
     if not profile_path.exists():
         raise FileNotFoundError(f"Profile file not found: {profile_path}")
     prof = read_profiles(profile_path)
+
+    # ── Land-split co-optimisation: solar & wind share ONE land budget (a separate
+    #    LP, core/land_split.py). Short-circuits the single-nameplate scenario flow.
+    if bool(inputs.get("land_split")):
+        return _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof,
+                               profile_used=str(profile_path))
 
     # ── Land-first derivation: parcels set the nameplates when not given explicitly.
     if parcels.get("solar") and inputs.get("pv_mw") is None:
@@ -631,6 +648,146 @@ def _native_dt_hours(df: pd.DataFrame) -> float:
     return round(df["timestamp"].diff().dropna().median().total_seconds() / 3600.0, 6)
 
 
+def _parcel_density(parcel: Optional[dict], default: float) -> float:
+    """MW/ha implied by a parcel (max_mw ÷ area_ha), else the site default."""
+    if parcel and parcel.get("area_ha") and parcel.get("max_mw"):
+        return round(parcel["max_mw"] / parcel["area_ha"], 4)
+    return default
+
+
+def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, profile_used="") -> Path:
+    """Co-optimise the solar/wind split of a shared land budget. Objective:
+      min_grid (default) → the lowest-grid design (headline) + the grid↔battery
+                           trade-off (how much battery buys how much grid reduction).
+      min_bess           → the per-SSR land-split frontier.
+    Uses the RAW (unfolded) solar/wind profiles so each is an independent LP variable."""
+    from core.land_split import (land_split_frontier, grid_battery_tradeoff,
+                                  solve_land_split, SOLAR_MW_PER_HA, WIND_MW_PER_HA)
+    eff = _effective(inputs)
+
+    # Scale the load shape to the combined consumer peak (Loads sheet or load_peak_mw).
+    df = prof.df.copy()
+    peak = eff["load_peak_mw"] or loads_peak or None
+    if peak and float(df["load_mw"].max()) > 1e-9:
+        df["load_mw"] = df["load_mw"] * (float(peak) / float(df["load_mw"].max()))
+
+    # Shared land budget: explicit, else the largest Parcels area (the solar/wind
+    # rows describe the SAME shared land, so take the max — not the sum).
+    total_area_ha = eff["total_area_ha"]
+    if not total_area_ha:
+        areas = [p["area_ha"] for p in parcels.values() if p.get("area_ha")]
+        total_area_ha = max(areas) if areas else None
+    if not total_area_ha:
+        raise ValueError("land_split needs a shared land budget — set total_area_ha or add a Parcels sheet.")
+    total_area_ha = float(total_area_ha)
+
+    objective = (eff["land_split_objective"] or "min_grid").strip().lower()
+    if objective not in ("min_grid", "min_bess"):
+        objective = "min_grid"
+    solar_rho = _parcel_density(parcels.get("solar"), SOLAR_MW_PER_HA)
+    wind_rho = _parcel_density(parcels.get("wind"), WIND_MW_PER_HA)
+    tl = eff["solver_time_limit"]
+
+    params = PhysicalParams(
+        dt_hours=prof.dt_hours,
+        eff_charge=eff["eff_charge"], eff_discharge=eff["eff_discharge"],
+        min_soc_pct=eff["min_soc_pct"], max_soc_pct=eff["max_soc_pct"],
+        initial_soc_pct=eff["initial_soc_pct"],
+        min_bess_duration_h=eff["min_bess_duration_h"], max_bess_duration_h=eff["max_bess_duration_h"],
+        site_max_bess_mw=eff["site_max_bess_mw"], site_max_bess_mwh=eff["site_max_bess_mwh"],
+        site_max_grid_mw=eff["site_max_grid_mw"],
+        site_topology="grid_connected_btm",
+    )
+    kw = dict(solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho, time_limit=tl)
+
+    single, table, table_sheet = None, None, "Land Split"
+    if objective == "min_grid":
+        # Headline: the lowest achievable grid connection (battery up to site cap),
+        # with the least battery that reaches it.
+        single = solve_land_split(df, params, total_area_ha=total_area_ha,
+                                  ssr_target_pct=0.0, objective="min_grid", **kw)
+        # Trade-off: grid connection vs battery, from 0 up to the battery the
+        # lowest-grid design uses (beyond it the grid can't improve).
+        max_batt = single.get("bess_mwh", 0.0) if single.get("feasible") else eff["site_max_bess_mwh"]
+        steps = sorted({round(max_batt * f, 1) for f in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)}) \
+            if (max_batt and max_batt > 1e-6) else [0.0]
+        table = grid_battery_tradeoff(df, params, total_area_ha=total_area_ha,
+                                      battery_mwh_steps=steps, **kw)
+        table_sheet = "Grid vs Battery"
+    else:
+        ssr_targets = eff["ssr_targets_pct"] or [50.0, 60.0, 70.0, 80.0, 90.0]
+        table = land_split_frontier(df, params, total_area_ha=total_area_ha,
+                                    ssr_targets_pct=tuple(ssr_targets), objective="min_bess", **kw)
+        table_sheet = "Land Split"
+
+    meta = {
+        "total_area_ha": total_area_ha, "objective": objective,
+        "solar_density_mw_per_ha": solar_rho, "wind_density_mw_per_ha": wind_rho,
+        "load_peak_mw": float(df["load_mw"].max()), "dt_hours": prof.dt_hours,
+    }
+    _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcels, loads,
+                      profile_used=profile_used)
+    return Path(out_path)
+
+
+def _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcels, loads,
+                      *, profile_used="") -> None:
+    """Write a land-split workbook: Inputs · Run Info · [Min Grid Design] · <table> · Parcels · Loads."""
+    out_path = Path(out_path)
+    eff = _effective(inputs)
+    has_rows = table is not None and not table.empty
+    obj = meta.get("objective")
+    obj_txt = ("least grid connection (lowest-grid design + grid↔battery trade-off)"
+               if obj == "min_grid" else "least BESS per SSR (grid connection reported)")
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        _input_template_frame(values=eff).to_excel(xw, sheet_name="Inputs", index=False)
+        info = {
+            "Project": eff.get("project_name") or "DIP Project",
+            "Location": eff.get("location") or "",
+            "Analysis": "Solar/Wind Land Split (co-optimised)",
+            "Objective": obj_txt,
+            "Shared land (ha)": meta.get("total_area_ha"),
+            "Solar density (MW/ha)": meta.get("solar_density_mw_per_ha"),
+            "Wind density (MW/ha)": meta.get("wind_density_mw_per_ha"),
+            "Load peak (MW)": round(meta.get("load_peak_mw", 0.0), 3),
+        }
+        if single is not None:
+            info["Lowest grid connection (MW)"] = (single.get("gcmin_mw") if single.get("feasible")
+                                                   else "infeasible")
+        info["Profile used"] = profile_used
+        info["Generated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _kv({k: _text(v) for k, v in info.items()}).to_excel(xw, sheet_name="Run Info", index=False)
+
+        # Headline single design (min_grid): the lowest-grid land split + battery.
+        if single is not None and single.get("feasible"):
+            design = {
+                "Lowest grid connection GCmin (MW)": single["gcmin_mw"],
+                "Solar (ha)": single["solar_ha"], "Solar (MW)": single["solar_mw"],
+                "Wind (ha)": single["wind_ha"], "Wind (MW)": single["wind_mw"],
+                "Solar share of land (%)": single["solar_share_pct"],
+                "Total land used (ha)": single["total_land_ha"],
+                "BESS (MW)": single["bess_mw"], "BESS (MWh)": single["bess_mwh"],
+                "Achieved SSR (%)": single["achieved_ssr_pct"],
+                "Curtailment (%)": single["curtailment_pct"],
+            }
+            _kv({k: _round(v) for k, v in design.items()}).to_excel(
+                xw, sheet_name="Min Grid Design", index=False)
+
+        if has_rows:
+            table.to_excel(xw, sheet_name=table_sheet, index=False)
+        if parcels:
+            pd.DataFrame([
+                {"tech": t, "area_ha": p["area_ha"], "lat": p["lat"], "lon": p["lon"],
+                 "max_mw": p["max_mw"], "solar_cf_pct": p["solar_cf_pct"]}
+                for t, p in parcels.items()
+            ]).to_excel(xw, sheet_name="Parcels", index=False)
+        if loads:
+            pd.DataFrame(loads).to_excel(xw, sheet_name="Loads", index=False)
+        for ws in xw.book.worksheets:
+            _autofit(ws, freeze=("B2" if ws.title in ("Land Split", "Grid vs Battery") else "A2"))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Write — ScenarioResult (+ echoed inputs) → sheets appended to the workbook
 # ──────────────────────────────────────────────────────────────────────────────
@@ -650,8 +807,10 @@ def _text(v: Any) -> str:
     return str(v)
 
 
-def _autofit(ws, max_w: int = 48) -> None:
-    ws.freeze_panes = "A2"
+def _autofit(ws, max_w: int = 48, freeze: str = "A2") -> None:
+    # `freeze` pins everything above/left of that cell while scrolling. "A2" pins
+    # the header row; "B2" also pins the first column (handy for wide time-series).
+    ws.freeze_panes = freeze
     for col in ws.columns:
         letter = col[0].column_letter
         width = max((len(str(c.value)) for c in col if c.value is not None), default=10)
@@ -724,6 +883,9 @@ def write_results(
             result.table.to_excel(xw, sheet_name="Frontier", index=False)
         if result.flows is not None and not result.flows.empty:
             result.flows.head(max_flow_rows).to_excel(xw, sheet_name="Flows", index=False)
+        point_freezes: dict = {}
+        if getattr(result, "point_flows", None) and isinstance(result.point_flows, dict):
+            point_freezes = _write_point_flows_sheets(xw, result.point_flows, meta, max_flow_rows=max_flow_rows)
 
         # 5. Echo the land parcels and consumers that shaped the run.
         if parcels:
@@ -735,8 +897,67 @@ def write_results(
         if loads:
             pd.DataFrame(loads).to_excel(xw, sheet_name="Loads", index=False)
 
+        # Freeze the header row everywhere; also pin the first column on the wide
+        # time-series sheets, and pin the hourly-table header on per-point sheets.
         for ws in xw.book.worksheets:
-            _autofit(ws)
+            if ws.title in point_freezes:
+                _autofit(ws, freeze=point_freezes[ws.title])
+            elif ws.title in ("Flows", "Frontier"):
+                _autofit(ws, freeze="B2")
+            else:
+                _autofit(ws)
+
+
+def _write_point_flows_sheets(
+    xw: pd.ExcelWriter,
+    point_flows: dict,
+    meta: dict,
+    max_flow_rows: int = 40000,
+) -> dict:
+    """Write individual flow detail tabs for each point along a sizing curve/sweep.
+
+    Returns {sheet_name: freeze_cell} so the caller can pin the HOURLY table's own
+    header row (not the block title) while scrolling the 8760 rows."""
+    from core.report import hourly_flows, energy_split, monthly
+    dt_hours = float(meta.get("dt_hours", 1.0) or 1.0) if meta else 1.0
+    freezes: dict = {}
+    for sheet_name, f_df in point_flows.items():
+        if f_df is None or f_df.empty:
+            continue
+        # Excel limits sheet names to 31 characters
+        s_name = str(sheet_name)[:31]
+        try:
+            es = energy_split(f_df, dt_hours)
+            bal = pd.DataFrame({
+                "Energy flow (MWh/yr)": ["Total demand (load)", "  served by PV directly", "  served by BESS discharge",
+                                         "  imported from grid", "  unmet (shed)", "PV available", "PV used on-site", "PV curtailed"],
+                "MWh/yr": [es.get("Load (MWh)", 0), es.get("PV → Load (MWh)", 0), es.get("BESS → Load (MWh)", 0),
+                           es.get("Grid → Load (MWh)", 0), es.get("Unmet (MWh)", 0), es.get("PV available (MWh)", 0),
+                           es.get("PV used (MWh)", 0), es.get("PV curtailed (MWh)", 0)]
+            })
+            m_df = monthly(f_df, dt_hours)
+            hf = hourly_flows(f_df).head(max_flow_rows)
+
+            def _write_block(title: str, dfb: pd.DataFrame, cur: int) -> int:
+                dfb.to_excel(xw, sheet_name=s_name, index=False, startrow=cur + 1)
+                xw.sheets[s_name].cell(row=cur + 1, column=1, value=title)
+                return cur + 1 + 1 + len(dfb) + 1
+
+            cur = 0
+            cur = _write_block("ANNUAL ENERGY BALANCE", bal, cur)
+            cur = _write_block("MONTHLY BREAKDOWN", m_df, cur)
+            hourly_cur = cur                       # remember where the hourly block starts
+            cur = _write_block("HOURLY ENERGY FLOWS  (merit order; CHECK = Load)", hf, cur)
+            # Hourly header lands at Excel row hourly_cur+2 (title at +1). Pin rows
+            # 1..header + the first (timestamp) column so both stay visible on scroll.
+            freezes[s_name] = f"B{hourly_cur + 3}"
+        except Exception:
+            try:
+                hourly_flows(f_df).head(max_flow_rows).to_excel(xw, sheet_name=s_name, index=False)
+            except Exception:
+                f_df.head(max_flow_rows).to_excel(xw, sheet_name=s_name, index=False)
+            freezes[s_name] = "B2"
+    return freezes
 
 
 def _round(v: Any) -> Any:
@@ -839,6 +1060,8 @@ def build_example(out_path: Union[str, Path],
         loads.to_excel(xw, sheet_name="Loads", index=False)
         profiles.to_excel(xw, sheet_name="Energy Timeseries", index=False)
         for ws in xw.book.worksheets:
-            if ws.title != "Energy Timeseries":     # don't autofit 8760 rows
+            if ws.title == "Energy Timeseries":
+                ws.freeze_panes = "B2"              # pin header + date col (skip slow autofit)
+            else:
                 _autofit(ws)
     return out_path
