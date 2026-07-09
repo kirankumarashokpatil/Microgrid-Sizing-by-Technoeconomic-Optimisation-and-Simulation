@@ -573,7 +573,9 @@ function InspField({ label, value, nodeId, paramKey, onChange }) {
     <div>
       <div style={{fontSize:11,color:"#94a3b8",marginBottom:4,fontWeight:600,
                    letterSpacing:0.3,textTransform:"uppercase"}}>{label}</div>
-      <input type="number" defaultValue={value} key={`${nodeId}-${paramKey}-${value}`}
+      {/* Key is node+param only (not value) so the field survives its own onChange
+          re-render — otherwise it would remount per keystroke and lose focus. */}
+      <input type="number" defaultValue={value} key={`${nodeId}-${paramKey}`}
         onChange={e=>onChange(+e.target.value)}
         style={{width:"100%",padding:"7px 10px",border:"1px solid #e2e8ea",
                 borderRadius:7,fontSize:13,fontFamily:"inherit",color:"#2f3a41",
@@ -603,8 +605,8 @@ function ToggleRow({ label, checked, onChange }) {
 /* ──────────────────────────────────────────────────
  * INSPECTOR PANEL
  * ────────────────────────────────────────────────── */
-function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onRemoveNode,
-                          onSetFlowOn, onSetPriority }) {
+function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onSetConsumerField,
+                          onRemoveNode, onSetFlowOn, onSetPriority }) {
   const selNode = nodes.find(n=>n.id===selectedId);
   const selFlow = flows.find(f=>f.id===selectedId);
 
@@ -676,14 +678,18 @@ function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onRemo
               onChange={v=>onSetParam(selNode.id,"allow_export",v)}/>
           </>}
 
-          {selNode.type==="consumer" && (
-            <div style={{padding:"10px 12px",background:"#eff6ff",border:"1px solid #bfdbfe",
-                         borderRadius:8,fontSize:12,color:"#1e40af",lineHeight:1.7}}>
-              Loads are defined in <strong>Step 1 — Consumer &amp; Load</strong>.<br/>
-              Peak: <strong>{selNode.params.peak_mw} MW</strong> ·
-              Base: <strong>{selNode.params.baseline_mw} MW</strong>
+          {selNode.type==="consumer" && <>
+            <InspField label="Peak MW" value={selNode.params.peak_mw}
+              nodeId={selNode.id} paramKey="peak_mw"
+              onChange={v=>onSetConsumerField(selNode.id,"peak_mw",v)}/>
+            <InspField label="Baseline MW" value={selNode.params.baseline_mw}
+              nodeId={selNode.id} paramKey="baseline_mw"
+              onChange={v=>onSetConsumerField(selNode.id,"baseline_mw",v)}/>
+            <div style={{padding:"9px 11px",background:"#eff6ff",border:"1px solid #bfdbfe",
+                         borderRadius:8,fontSize:11.5,color:"#1e40af",lineHeight:1.55}}>
+              ✎ Edits here sync to <strong>Step 2 — Consumer &amp; Demand</strong>.
             </div>
-          )}
+          </>}
         </div>
 
         {selNode.type!=="consumer" && selNode.type!=="grid" && (
@@ -819,7 +825,7 @@ function InspectorPanel({ nodes, flows, selectedId, onRename, onSetParam, onRemo
 }
 
 /* ─── Main component ─── */
-export default function FlowDesigner({ cfg, onTopoChange, step, go }) {
+export default function FlowDesigner({ cfg, onTopoChange, onLoadsChange, step, go }) {
   const canvasContainerRef = useRef();
   const [canvasSize, setCanvasSize] = useState({ w:820, h:480 });
   const [tool, setTool] = useState("pointer");
@@ -959,12 +965,26 @@ export default function FlowDesigner({ cfg, onTopoChange, step, go }) {
 
   const renameNode = useCallback((id, name) => {
     if (!name?.trim()) return;
-    setNodes(prev=>{const next=prev.map(n=>n.id===id?{...n,name:name.trim()}:n);notify(next,flows);return next;});
-  }, [flows,notify]);
+    const nm = name.trim();
+    setNodes(prev=>{const next=prev.map(n=>n.id===id?{...n,name:nm}:n);notify(next,flows);return next;});
+    // A renamed consumer is a load — keep it in sync with Step 2 (cfg.loads).
+    if (onLoadsChange && nodes.find(n=>n.id===id)?.type==="consumer")
+      onLoadsChange((cfg.loads||[]).map(l=>l.id===id?{...l,name:nm}:l));
+  }, [flows,notify,nodes,onLoadsChange,cfg.loads]);
 
   const setNodeParam = useCallback((id, key, val) => {
     setNodes(prev=>{const next=prev.map(n=>n.id===id?{...n,params:{...n.params,[key]:val}}:n);notify(next,flows);return next;});
   }, [flows,notify]);
+
+  // Consumer demand edited from the network inspector must flow back to cfg.loads —
+  // the single source of truth Step 2 (Consumer & Demand) reads from — so the two
+  // stay in sync. Updates the canvas node locally AND patches the shared loads array;
+  // the cfg.loads→nodes sync effect then sees a match and no-ops (no rebuild, no
+  // focus loss).
+  const setConsumerField = useCallback((id, key, val) => {
+    setNodes(prev=>{const next=prev.map(n=>n.id===id?{...n,params:{...n.params,[key]:val}}:n);notify(next,flows);return next;});
+    if (onLoadsChange) onLoadsChange((cfg.loads||[]).map(l=>l.id===id?{...l,[key]:val}:l));
+  }, [flows,notify,onLoadsChange,cfg.loads]);
 
   const dragNode = useCallback((id, x, y) => {
     setNodes(prev=>prev.map(n=>n.id===id?{...n,x,y}:n));
@@ -1182,6 +1202,7 @@ export default function FlowDesigner({ cfg, onTopoChange, step, go }) {
             selectedId={selectedId}
             onRename={renameNode}
             onSetParam={setNodeParam}
+            onSetConsumerField={setConsumerField}
             onRemoveNode={removeNode}
             onSetFlowOn={setFlowOn}
             onSetPriority={setPriority}/>

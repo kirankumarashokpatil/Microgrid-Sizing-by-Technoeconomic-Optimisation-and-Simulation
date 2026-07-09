@@ -17,6 +17,12 @@ export function StepNetworkDesign({ cfg, patch, step, go }) {
   }
 
   return (
-    <FlowDesigner cfg={cfg} onTopoChange={handleTopoChange} step={step} go={go} />
+    <FlowDesigner
+      cfg={cfg}
+      onTopoChange={handleTopoChange}
+      onLoadsChange={(loads) => patch({ loads })}  // load edits flow back to Step 2
+      step={step}
+      go={go}
+    />
   );
 }
