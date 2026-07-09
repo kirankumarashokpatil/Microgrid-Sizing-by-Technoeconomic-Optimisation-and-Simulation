@@ -98,18 +98,27 @@ FIELDS: list[dict] = [
     dict(key="bess_mwh", type="float", default=0.0, group="Generation & design",
          help="Fixed BESS energy (MWh). 0 ⇒ let the engine size it."),
 
-    # ── Targets ──
-    dict(key="target_ssr_pct", type="float", default=60.0, group="Targets",
-         help="Self-sufficiency target (%). Used by SSR scenarios."),
-    dict(key="target_gc_mw", type="float", default="", group="Targets",
-         help="Grid-connection cap (MW). Blank ⇒ not a GC scenario."),
-    dict(key="target_firmness_pct", type="float", default=99.0, group="Targets",
-         help="Firmness target (%) for off-grid sizing."),
-    dict(key="target_curtailment_pct", type="float", default=5.0, group="Targets",
-         help="Max curtailment (%) for standalone export sizing."),
-    dict(key="grid_ceiling_mw", type="float", default="", group="Targets",
+    # ── Objective — declared by WHICH targets/flags you set (blank ⇒ not chosen).
+    #    This is how the scenario is detected: set an SSR target for an SSR run, a
+    #    GC target for a grid-connection run, both for the SSR+GC co-opt, etc. Leave
+    #    the others blank so they don't shadow your intent.
+    dict(key="target_ssr_pct", type="float", default="", group="Objective",
+         help="Self-sufficiency target (%). SET THIS for an SSR run; blank ⇒ not an SSR objective."),
+    dict(key="target_gc_mw", type="float", default="", group="Objective",
+         help="Grid-connection cap (MW). SET THIS for a grid-connection run; blank ⇒ not a GC objective."),
+    dict(key="min_grid", type="bool", default=False, group="Objective",
+         help="true ⇒ find the LOWEST achievable grid connection (GCmin), not a fixed target."),
+    dict(key="size_pv", type="bool", default=False, group="Objective",
+         help="true ⇒ size PV as a variable too (PV+BESS surface), instead of a fixed nameplate."),
+    dict(key="verify", type="bool", default=False, group="Objective",
+         help="true ⇒ operationally verify a fixed design (needs bess_mw & bess_mwh set)."),
+    dict(key="target_firmness_pct", type="float", default="", group="Objective",
+         help="Firmness target (%) for off-grid sizing. Blank ⇒ engine default (99) when needed."),
+    dict(key="target_curtailment_pct", type="float", default="", group="Objective",
+         help="Max curtailment (%) for standalone export. Blank ⇒ engine default (5) when needed."),
+    dict(key="grid_ceiling_mw", type="float", default="", group="Objective",
          help="Hard grid ceiling threaded into firmness sizing. Blank ⇒ site max."),
-    dict(key="deliverable_target", type="str", default="ssr", group="Targets",
+    dict(key="deliverable_target", type="str", default="ssr", group="Objective",
          help="Which target the deliverable size must hit: ssr | gc."),
 
     # ── Topology & site limits ──
@@ -464,16 +473,24 @@ def build_context(
             gen_df["pv_pu"] = combined / peak
             eng_pv_mw = peak
 
-    # Decide the scenario: explicit id wins; otherwise auto-detect from intent.
+    # Decide the scenario purely from intent. The rule the resolver was built on:
+    # a target/flag counts ONLY when it is set (blank ⇒ None ⇒ not chosen), so the
+    # objective you fill in is the objective you get — no target silently shadows
+    # another. size_pv presents PV as a profile to SIZE (→ PV+BESS surface);
+    # min_grid asks for the lowest grid connection; verify checks a fixed design.
+    size_pv = bool(eff["size_pv"])
     resolver_inputs = {
-        "pv_mw": eng_pv_mw,                       # a fixed generation nameplate is present
+        "pv_mw": None if size_pv else eng_pv_mw,   # size_pv ⇒ no fixed nameplate
+        "pv_unit_profile": size_pv,
         "bess_mw": eff["bess_mw"], "bess_mwh": eff["bess_mwh"],
         "off_grid": eff["site_topology"] == "off_grid",
         "standalone": eff["site_topology"] == "standalone_gen",
         "target_ssr_pct": eff["target_ssr_pct"],
         "target_gc_mw": eff["target_gc_mw"],
-        "target_firmness_pct": eff["target_firmness_pct"] if eff["site_topology"] == "off_grid" else None,
-        "target_curtailment_pct": eff["target_curtailment_pct"] if eff["site_topology"] == "standalone_gen" else None,
+        "target_firmness_pct": eff["target_firmness_pct"],
+        "target_curtailment_pct": eff["target_curtailment_pct"],
+        "min_grid": bool(eff["min_grid"]),
+        "verify": bool(eff["verify"]),
         "pv_sweep_mw": eff["pv_sweep_mw"] or [],
         "ssr_targets_pct": eff["ssr_targets_pct"] or [],
     }
@@ -502,11 +519,14 @@ def build_context(
         allow_grid_charge=eff["allow_grid_charge"],
     )
 
+    # For the RUN itself, a scenario that needs a target still needs a concrete
+    # number — fall back to the engine defaults (60 / 99 / 5) when the cell is blank.
     ctx = ScenarioContext(
         profiles_df=gen_df, params=params, pv_mw=eng_pv_mw,
-        target_ssr_pct=eff["target_ssr_pct"], target_gc_mw=eff["target_gc_mw"],
-        target_firmness_pct=eff["target_firmness_pct"],
-        target_curtailment_pct=eff["target_curtailment_pct"],
+        target_ssr_pct=eff["target_ssr_pct"] if eff["target_ssr_pct"] is not None else 60.0,
+        target_gc_mw=eff["target_gc_mw"],
+        target_firmness_pct=eff["target_firmness_pct"] if eff["target_firmness_pct"] is not None else 99.0,
+        target_curtailment_pct=eff["target_curtailment_pct"] if eff["target_curtailment_pct"] is not None else 5.0,
         bess_mw=eff["bess_mw"], bess_mwh=eff["bess_mwh"],
         grid_ceiling_mw=eff["grid_ceiling_mw"],
         deliverable_target=eff["deliverable_target"],
@@ -567,6 +587,16 @@ def run_workbook(
     # ── Multiple consumers: their combined peak scales the demand shape.
     if loads and inputs.get("load_peak_mw") is None:
         inputs["load_peak_mw"] = loads_peak
+
+    # ── PV-sizing (size_pv): a PV+BESS surface needs a PV sweep and target list.
+    #    Derive them from the land you have when not supplied — sweep PV up to the
+    #    parcel's max, over a spread of SSR targets (unless a GC target is set).
+    if bool(inputs.get("size_pv")):
+        max_pv = parcels.get("solar", {}).get("max_mw") or inputs.get("pv_mw") or prof.solar_np or 0.0
+        if max_pv and not inputs.get("pv_sweep_mw"):
+            inputs["pv_sweep_mw"] = [round(max_pv * f, 1) for f in (0.4, 0.6, 0.8, 1.0)]
+        if not inputs.get("ssr_targets_pct") and inputs.get("target_gc_mw") is None:
+            inputs["ssr_targets_pct"] = [50.0, 60.0, 70.0, 80.0]
 
     # ── Grid flags → the numeric limits the engine understands.
     _apply_grid_flags(inputs)
@@ -726,6 +756,8 @@ def _input_template_frame(values: Optional[dict] = None) -> pd.DataFrame:
         if values is not None and f["key"] in values and values[f["key"]] is not None:
             v = values[f["key"]]
             shown = ", ".join(str(x) for x in v) if isinstance(v, list) else v
+        if isinstance(shown, bool):                 # render flags as true/false, not 1/0
+            shown = "true" if shown else "false"
         rows.append({
             "Group": f["group"],
             "Parameter": f["key"],
