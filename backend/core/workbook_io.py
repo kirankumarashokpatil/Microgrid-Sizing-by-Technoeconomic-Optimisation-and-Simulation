@@ -776,6 +776,7 @@ def _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcel
 
         if has_rows:
             table.to_excel(xw, sheet_name=table_sheet, index=False)
+            _add_land_split_charts(xw.sheets[table_sheet], len(table), obj)
         if parcels:
             pd.DataFrame([
                 {"tech": t, "area_ha": p["area_ha"], "lat": p["lat"], "lon": p["lon"],
@@ -786,6 +787,71 @@ def _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcel
             pd.DataFrame(loads).to_excel(xw, sheet_name="Loads", index=False)
         for ws in xw.book.worksheets:
             _autofit(ws, freeze=("B2" if ws.title in ("Land Split", "Grid vs Battery") else "A2"))
+
+
+def _add_land_split_charts(ws, n_rows: int, objective: str) -> None:
+    """Embed native Excel charts on the land-split result sheet so the trade-off is
+    visual, not just tabular. Column positions follow the column order written just
+    above (min_grid → Grid vs Battery cols; min_bess → Land Split cols). Series are
+    coloured to match the decision view (solar amber, wind blue, battery green,
+    grid violet)."""
+    if n_rows < 1:
+        return
+    from openpyxl.chart import BarChart, LineChart, ScatterChart, Reference, Series
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.chart.marker import Marker
+    from openpyxl.drawing.line import LineProperties
+
+    SOLAR, WIND, BATT, GRID = "EDA100", "2A78D6", "1F8F1F", "4A3AA7"
+    r1 = n_rows + 1                              # header row 1, data rows 2..n+1
+
+    def paint(series, hexc, line=False):
+        if line:
+            gp = GraphicalProperties(); gp.line = LineProperties(solidFill=hexc, w=28000)
+        else:
+            gp = GraphicalProperties(solidFill=hexc)
+        series.graphicalProperties = gp
+
+    if objective == "min_grid":
+        # Grid vs Battery: A battery_cap · C gcmin · F solar_ha · G wind_ha
+        sc = ScatterChart(); sc.title = "Grid connection vs battery"
+        sc.x_axis.title = "Battery (MWh)"; sc.y_axis.title = "Grid connection (MW)"
+        sc.height, sc.width, sc.legend = 8, 15, None
+        s = Series(Reference(ws, min_col=3, min_row=1, max_row=r1),
+                   Reference(ws, min_col=1, min_row=2, max_row=r1), title_from_data=True)
+        paint(s, GRID, line=True); s.marker = Marker(symbol="circle", size=6)
+        sc.series.append(s); ws.add_chart(sc, "L2")
+
+        bc = BarChart(); bc.type = "col"; bc.grouping = "stacked"; bc.overlap = 100
+        bc.title = "Land split by battery"; bc.y_axis.title = "hectares"; bc.x_axis.title = "Battery cap (MWh)"
+        bc.height, bc.width = 8, 15
+        bc.add_data(Reference(ws, min_col=6, max_col=7, min_row=1, max_row=r1), titles_from_data=True)
+        bc.set_categories(Reference(ws, min_col=1, min_row=2, max_row=r1))
+        paint(bc.series[0], SOLAR); paint(bc.series[1], WIND)
+        ws.add_chart(bc, "L20")
+    else:
+        # Land Split per SSR: A ssr · D gcmin · G solar_ha · H wind_ha · L bess_mwh
+        cats = Reference(ws, min_col=1, min_row=2, max_row=r1)
+        land = BarChart(); land.type = "col"; land.grouping = "stacked"; land.overlap = 100
+        land.title = "Land allocation by self-sufficiency"; land.y_axis.title = "hectares"; land.x_axis.title = "SSR %"
+        land.height, land.width = 7.5, 15
+        land.add_data(Reference(ws, min_col=7, max_col=8, min_row=1, max_row=r1), titles_from_data=True)
+        land.set_categories(cats); paint(land.series[0], SOLAR); paint(land.series[1], WIND)
+        ws.add_chart(land, "P2")
+
+        batt = BarChart(); batt.type = "col"; batt.legend = None
+        batt.title = "Battery by self-sufficiency"; batt.y_axis.title = "MWh"; batt.x_axis.title = "SSR %"
+        batt.height, batt.width = 7.5, 15
+        batt.add_data(Reference(ws, min_col=12, max_col=12, min_row=1, max_row=r1), titles_from_data=True)
+        batt.set_categories(cats); paint(batt.series[0], BATT)
+        ws.add_chart(batt, "P18")
+
+        grid = LineChart(); grid.legend = None
+        grid.title = "Grid connection by self-sufficiency"; grid.y_axis.title = "MW"; grid.x_axis.title = "SSR %"
+        grid.height, grid.width = 7.5, 15
+        grid.add_data(Reference(ws, min_col=4, max_col=4, min_row=1, max_row=r1), titles_from_data=True)
+        grid.set_categories(cats); paint(grid.series[0], GRID, line=True)
+        ws.add_chart(grid, "P34")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
