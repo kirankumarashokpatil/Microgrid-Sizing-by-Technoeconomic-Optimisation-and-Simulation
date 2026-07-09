@@ -68,7 +68,7 @@ from core.scenarios import (                                 # noqa: E402
 )
 
 # Default bundled dataset, so the API works out-of-the-box with real profiles.
-_DEFAULT_PROFILE = _REPO_ROOT / "data" / "8760_PV&Load Profiles.xlsx"
+_DEFAULT_PROFILE = _REPO_ROOT / "data" / "Energy Timeseries.xlsx"
 
 # Where uploaded files land (a private temp dir, cleaned by the OS).
 _UPLOAD_DIR = Path(tempfile.gettempdir()) / "scenario_uploads"
@@ -98,7 +98,13 @@ def _load_profile(path: str) -> tuple[pd.DataFrame, float, float, float]:
         df, load_np, pv_np = load_profiles(xlsx_path=path)
     except Exception as first_err:
         try:
-            df, load_np, pv_np = load_bess_input(xlsx_path=path)
+            # Peek the native timestep so load_bess_input's finer-than-native guard
+            # doesn't reject coarser data (e.g. an hourly Energy Timeseries sheet).
+            _ts = pd.read_excel(path, sheet_name="Energy Timeseries", usecols=["date_time"])
+            _t = pd.to_datetime(_ts["date_time"], errors="coerce").dropna()
+            _dt = (round(_t.diff().dropna().median().total_seconds() / 3600.0, 4)
+                   if len(_t) >= 3 else 1.0)
+            df, load_np, pv_np = load_bess_input(xlsx_path=path, dt_hours=_dt)
         except Exception as second_err:
             raise ValueError(
                 "Could not read this Excel in either known format. "
@@ -1680,3 +1686,56 @@ def export_xlsx(req: ExportRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Workbook I/O — Excel-in / Excel-out over HTTP. Same single-file contract as the
+# run_workbook.py CLI (core/workbook_io.py), so a future front end and the offline
+# spreadsheet share ONE path into the engine.
+# ──────────────────────────────────────────────────────────────────────────────
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _xlsx_response(path: Path, filename: str) -> StreamingResponse:
+    buf = io.BytesIO(path.read_bytes())
+    buf.seek(0)
+    return StreamingResponse(buf, media_type=_XLSX_MIME,
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.post("/run-workbook")
+async def run_workbook_endpoint(file: UploadFile = File(...)):
+    """Upload a project workbook (Inputs [+ Parcels/Loads/Energy Timeseries]); the
+    optimiser detects the scenario and returns the SAME workbook filled with Run
+    Info / Design / KPIs / Frontier / Flows. No JSON — pure Excel in, Excel out."""
+    from core.workbook_io import run_workbook
+    data = await file.read()
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / (file.filename or "input.xlsx")
+        in_path.write_bytes(data)
+        out_path = Path(td) / "result.xlsx"
+        try:
+            run_workbook(in_path, out_path)
+        except Exception as exc:                       # bad workbook = client error
+            raise HTTPException(status_code=400, detail=f"Workbook run failed: {exc}")
+        return _xlsx_response(out_path, "result.xlsx")
+
+
+@app.get("/workbook-template")
+def workbook_template():
+    """Download a ready-to-edit starter workbook (Inputs + Parcels + Loads)."""
+    from core.workbook_io import build_template
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "template.xlsx"
+        build_template(p)
+        return _xlsx_response(p, "dip_template.xlsx")
+
+
+@app.get("/workbook-example")
+def workbook_example():
+    """Download a fully-filled, self-contained example input (profiles embedded)."""
+    from core.workbook_io import build_example
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "example.xlsx"
+        build_example(p)
+        return _xlsx_response(p, "dip_example.xlsx")
