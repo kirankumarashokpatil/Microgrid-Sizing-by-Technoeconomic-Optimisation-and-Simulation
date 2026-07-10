@@ -177,7 +177,7 @@ FIELDS: list[dict] = [
     dict(key="pv_sweep_mw", type="list_float", default="", group="Sweeps",
          help="Comma-separated PV nameplates (MW) for a PV–BESS surface."),
     dict(key="ssr_targets_pct", type="list_float", default="", group="Sweeps",
-         help="Comma-separated SSR targets (%) for a curve/surface."),
+         help="Comma-separated SSR targets (%). Blank ⇒ dynamic sweep in 5% steps (≤5pp gap) up to the site's achievable SSR."),
 
     # ── Solver ──
     dict(key="solver_time_limit", type="int", default=120, group="Solver",
@@ -660,6 +660,16 @@ def _parcel_density(parcel: Optional[dict], default: float) -> float:
     return default
 
 
+def _dynamic_ssr_targets(ssr_max: float) -> list:
+    """SSR sweep targets with a ≤5-percentage-point gap, bounded by the site's
+    achievable SSR. e.g. an islandable site (ssr_max≈100) → 50,55,…,95; a site that
+    tops out near 78% → 50,55,…,75. Always steps of 5, so the gap never exceeds 5pp."""
+    ceil = max(30, min(95, 5 * int(ssr_max // 5)))
+    floor = 50 if ceil >= 55 else max(10, ceil - 20)
+    tgts = [float(x) for x in range(int(floor), int(ceil) + 1, 5)]
+    return tgts or [50.0, 60.0, 70.0, 80.0, 90.0]
+
+
 def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total_area_ha, profile_used="") -> Path:
     """Land-allocation SSR sweep: for each SSR target, carve the whole site across
     DC / solar / wind / battery and report the grid connection — one integrated
@@ -684,8 +694,6 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
     batt_density = 10000.0 / batt_m2_per_mwh if batt_m2_per_mwh > 0 else BATTERY_MWH_PER_HA
     solar_rho = _parcel_density(parcels.get("solar"), SOLAR_MW_PER_HA)
     wind_rho = _parcel_density(parcels.get("wind"), WIND_MW_PER_HA)
-    ssr_targets = eff["ssr_targets_pct"] or [50.0, 60.0, 70.0, 80.0, 90.0]
-
     params = PhysicalParams(
         dt_hours=prof.dt_hours,
         eff_charge=eff["eff_charge"], eff_discharge=eff["eff_discharge"],
@@ -700,16 +708,19 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
                    solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho,
                    time_limit=eff["solver_time_limit"])
 
-    # 1) SSR sweep + per-point hourly flows (the "why" behind each design).
-    table, point_flows = land_allocation_sweep(df, params, total_area_ha=total_area_ha,
-                                               ssr_targets_pct=tuple(ssr_targets),
-                                               return_flows=True, **land_kw)
-
-    # 2) Recommended design — the lowest grid connection this site+battery can reach
-    #    (least battery that gets there) — with its own hourly flows.
+    # 1) Recommended design first — the lowest grid connection this site+battery can
+    #    reach; its achieved SSR is the ceiling that bounds the dynamic sweep.
     best = solve_land_split(df, params, total_area_ha=total_area_ha, ssr_target_pct=0.0,
                             objective="min_grid", return_flows=True, **land_kw)
     best_flows = best.pop("flows", None)
+    ssr_max = best.get("achieved_ssr_pct", 90.0) if best.get("feasible") else 90.0
+
+    # 2) SSR targets: explicit override, else a DYNAMIC sweep with a ≤5-pp gap, up to
+    #    the achievable SSR. Sweep each with its hourly flows.
+    ssr_targets = eff["ssr_targets_pct"] or _dynamic_ssr_targets(ssr_max)
+    table, point_flows = land_allocation_sweep(df, params, total_area_ha=total_area_ha,
+                                               ssr_targets_pct=tuple(ssr_targets),
+                                               return_flows=True, **land_kw)
     if best_flows is not None:
         point_flows = {"Recommended": best_flows, **point_flows}
 
@@ -726,6 +737,8 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
         "battery_m2_per_mwh": round(batt_m2_per_mwh, 1), "avail_ha": round(total_area_ha - dc_ha, 1),
         "solar_density_mw_per_ha": solar_rho, "wind_density_mw_per_ha": wind_rho,
         "load_peak_mw": load_peak, "dt_hours": prof.dt_hours,
+        "ssr_sweep": (f"{int(min(ssr_targets))}–{int(max(ssr_targets))}% in 5% steps"
+                      + (" (dynamic)" if not eff["ssr_targets_pct"] else " (from inputs)")),
     }
     _write_land_split(out_path, inputs, table, best, tradeoff, point_flows, meta, parcels, loads,
                       profile_used=profile_used)
@@ -756,6 +769,7 @@ def _write_land_split(out_path, inputs, table, best, tradeoff, point_flows, meta
             "Wind density (MW/ha)": meta.get("wind_density_mw_per_ha"),
             "Battery land (m²/MWh)": meta.get("battery_m2_per_mwh"),
             "DC load peak (MW)": round(meta.get("load_peak_mw", 0.0), 3),
+            "SSR sweep": meta.get("ssr_sweep"),
             "SSR points solved": n_feasible,
             "Profile used": profile_used,
             "Generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
