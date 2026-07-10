@@ -47,15 +47,23 @@ def solve_land_split(
     *,
     total_area_ha: float,
     ssr_target_pct: float,
+    objective: str = "min_bess",
+    bess_mwh_cap: float | None = None,
     dc_ha: float = 0.0,
     battery_mwh_per_ha: float = BATTERY_MWH_PER_HA,
     solar_density_mw_per_ha: float = SOLAR_MW_PER_HA,
     wind_density_mw_per_ha: float = WIND_MW_PER_HA,
+    return_flows: bool = False,
     tiebreak: float = 1e-4,
     time_limit: int = 120,
 ) -> dict:
-    """Allocate the site (solar/wind/battery within total − DC) to hit one SSR target
-    with the LEAST battery; report the grid connection and the full land split."""
+    """Allocate the site (solar/wind/battery within total − DC) and size storage.
+
+    objective="min_bess" (default): least battery to hit ssr_target_pct — the SSR
+      sweep; grid connection is read back.
+    objective="min_grid": least grid connection (battery up to bess_mwh_cap, if set)
+      — the grid↔battery trade-off; SSR is read back.
+    """
     dt = params.dt_hours
     n = len(df)
     solar_pu = df["pv_pu"].to_numpy()
@@ -73,8 +81,10 @@ def solve_land_split(
     m.solar_mw = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, avail_ha * solar_density_mw_per_ha))
     m.wind_mw = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, avail_ha * wind_density_mw_per_ha))
     m.bess_mw = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, params.site_max_bess_mw))
-    m.bess_mwh = pyo.Var(within=pyo.NonNegativeReals,
-                         bounds=(0, min(params.site_max_bess_mwh, avail_ha * battery_mwh_per_ha)))
+    bess_ub = min(params.site_max_bess_mwh, avail_ha * battery_mwh_per_ha)   # land also caps energy
+    if bess_mwh_cap is not None:                                            # trade-off sweep cap
+        bess_ub = min(bess_ub, max(0.0, bess_mwh_cap))
+    m.bess_mwh = pyo.Var(within=pyo.NonNegativeReals, bounds=(0, bess_ub))
     m.peak_gc = pyo.Var(within=pyo.NonNegativeReals)     # grid-connection tracker
 
     # ── Time-series variables ─────────────────────────────────────────────
@@ -120,8 +130,11 @@ def solve_land_split(
     m.ssr_con = pyo.Constraint(
         expr=sum(m.p_grid[t] for t in m.T) * dt <= (1.0 - ssr_target_pct / 100.0) * total_demand)
 
-    # ── Objective: least battery to hit the SSR (grid connection reported) ──
-    m.obj = pyo.Objective(expr=m.bess_mwh + tiebreak * m.peak_gc, sense=pyo.minimize)
+    # ── Objective ────────────────────────────────────────────────────────
+    if objective == "min_grid":
+        m.obj = pyo.Objective(expr=m.peak_gc + tiebreak * m.bess_mwh, sense=pyo.minimize)
+    else:  # min_bess
+        m.obj = pyo.Objective(expr=m.bess_mwh + tiebreak * m.peak_gc, sense=pyo.minimize)
 
     solver = create_highs_solver(time_limit_seconds=time_limit)
     try:
@@ -148,7 +161,31 @@ def solve_land_split(
     wind_ha = wind_mw / wind_density_mw_per_ha
     battery_ha = bess_mwh / battery_mwh_per_ha
 
-    return {
+    # Hourly dispatch — the "why" behind the design: when generation serves the load,
+    # charges the battery, is curtailed, and when the grid steps in.
+    flows = None
+    if return_flows:
+        p_gen = np.array([pyo.value(m.p_gen[t]) for t in m.T])
+        p_grid = np.array([pyo.value(m.p_grid[t]) for t in m.T])
+        p_chg = np.array([pyo.value(m.p_chg[t]) for t in m.T])
+        p_dchg = np.array([pyo.value(m.p_dchg[t]) for t in m.T])
+        p_curt = np.array([pyo.value(m.p_curt[t]) for t in m.T])
+        e_bess = np.array([pyo.value(m.e_bess[t]) for t in m.T])
+        flows = pd.DataFrame({
+            "Timestamp": df["timestamp"].values if "timestamp" in df.columns else np.arange(n),
+            "Load (MW)": load.round(3),
+            "Solar available (MW)": (solar_pu * solar_mw).round(3),
+            "Wind available (MW)": (wind_pu * wind_mw).round(3),
+            "Generation used (MW)": p_gen.round(3),
+            "Curtailed (MW)": p_curt.round(3),
+            "BESS charge (MW)": p_chg.round(3),
+            "BESS discharge (MW)": p_dchg.round(3),
+            "Grid import (MW)": p_grid.round(3),
+            "BESS SOC (MWh)": e_bess.round(2),
+            "CHECK served − load": (p_gen + p_grid + p_dchg - p_chg - load).round(3),
+        })
+
+    out = {
         "ssr_target_pct": round(float(ssr_target_pct), 1),
         "feasible": True,
         "achieved_ssr_pct": round(achieved_ssr, 2),
@@ -166,6 +203,9 @@ def solve_land_split(
         "solar_share_pct": round(100.0 * solar_ha / (solar_ha + wind_ha), 1) if (solar_ha + wind_ha) > 1e-9 else 0.0,
         "curtailment_pct": round(100.0 * curtailed / gen_total, 1) if gen_total > 1e-9 else 0.0,
     }
+    if flows is not None:
+        out["flows"] = flows
+    return out
 
 
 def land_allocation_sweep(
@@ -178,17 +218,54 @@ def land_allocation_sweep(
     battery_mwh_per_ha: float = BATTERY_MWH_PER_HA,
     solar_density_mw_per_ha: float = SOLAR_MW_PER_HA,
     wind_density_mw_per_ha: float = WIND_MW_PER_HA,
+    return_flows: bool = False,
     time_limit: int = 120,
-) -> pd.DataFrame:
+):
     """Sweep SSR targets → one row per target with the whole-site land allocation,
-    battery sizing and grid connection. Infeasible targets are kept (feasible=False)."""
-    rows = [solve_land_split(df, params, total_area_ha=total_area_ha, ssr_target_pct=float(s),
+    battery sizing and grid connection. Infeasible targets are kept (feasible=False).
+    With return_flows, also returns {label: hourly-flows DataFrame} per point."""
+    rows, point_flows = [], {}
+    for s in ssr_targets_pct:
+        r = solve_land_split(df, params, total_area_ha=total_area_ha, ssr_target_pct=float(s),
                              dc_ha=dc_ha, battery_mwh_per_ha=battery_mwh_per_ha,
                              solar_density_mw_per_ha=solar_density_mw_per_ha,
-                             wind_density_mw_per_ha=wind_density_mw_per_ha, time_limit=time_limit)
-            for s in ssr_targets_pct]
+                             wind_density_mw_per_ha=wind_density_mw_per_ha,
+                             return_flows=return_flows, time_limit=time_limit)
+        f = r.pop("flows", None)
+        rows.append(r)
+        if return_flows and f is not None:
+            point_flows[f"SSR {int(round(float(s)))}pct"] = f
     cols = ["ssr_target_pct", "feasible", "achieved_ssr_pct", "gcmin_mw",
             "dc_ha", "solar_ha", "solar_mw", "wind_ha", "wind_mw",
             "battery_ha", "bess_mw", "bess_mwh", "land_used_ha", "land_spare_ha",
             "solar_share_pct", "curtailment_pct"]
+    df_out = pd.DataFrame(rows, columns=cols)
+    return (df_out, point_flows) if return_flows else df_out
+
+
+def grid_battery_tradeoff(
+    df: pd.DataFrame,
+    params: PhysicalParams,
+    *,
+    total_area_ha: float,
+    battery_mwh_steps,
+    dc_ha: float = 0.0,
+    battery_mwh_per_ha: float = BATTERY_MWH_PER_HA,
+    solar_density_mw_per_ha: float = SOLAR_MW_PER_HA,
+    wind_density_mw_per_ha: float = WIND_MW_PER_HA,
+    time_limit: int = 120,
+) -> pd.DataFrame:
+    """For each battery-energy cap, co-optimise the four-way land split to MINIMISE
+    the grid connection. Shows how much battery buys how much grid reduction."""
+    rows = []
+    for cap in battery_mwh_steps:
+        r = solve_land_split(df, params, total_area_ha=total_area_ha, ssr_target_pct=0.0,
+                             objective="min_grid", bess_mwh_cap=float(cap), dc_ha=dc_ha,
+                             battery_mwh_per_ha=battery_mwh_per_ha,
+                             solar_density_mw_per_ha=solar_density_mw_per_ha,
+                             wind_density_mw_per_ha=wind_density_mw_per_ha, time_limit=time_limit)
+        r["battery_cap_mwh"] = round(float(cap), 1)
+        rows.append(r)
+    cols = ["battery_cap_mwh", "feasible", "gcmin_mw", "bess_mw", "bess_mwh",
+            "dc_ha", "solar_ha", "wind_ha", "battery_ha", "achieved_ssr_pct", "curtailment_pct"]
     return pd.DataFrame(rows, columns=cols)

@@ -665,8 +665,8 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
     DC / solar / wind / battery and report the grid connection — one integrated
     Frontier ('SSR Sweep' sheet). Uses the RAW (unfolded) solar/wind profiles so
     each is an independent LP variable."""
-    from core.land_split import (land_allocation_sweep, SOLAR_MW_PER_HA, WIND_MW_PER_HA,
-                                 BATTERY_MWH_PER_HA, DC_M2_PER_MW)
+    from core.land_split import (land_allocation_sweep, grid_battery_tradeoff, solve_land_split,
+                                 SOLAR_MW_PER_HA, WIND_MW_PER_HA, BATTERY_MWH_PER_HA, DC_M2_PER_MW)
     eff = _effective(inputs)
 
     # Scale the load shape to the DC's peak (Loads sheet or load_peak_mw).
@@ -696,11 +696,30 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
         site_max_grid_mw=eff["site_max_grid_mw"],
         site_topology="grid_connected_btm",
     )
-    table = land_allocation_sweep(
-        df, params, total_area_ha=total_area_ha, dc_ha=dc_ha,
-        ssr_targets_pct=tuple(ssr_targets), battery_mwh_per_ha=batt_density,
-        solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho,
-        time_limit=eff["solver_time_limit"])
+    land_kw = dict(dc_ha=dc_ha, battery_mwh_per_ha=batt_density,
+                   solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho,
+                   time_limit=eff["solver_time_limit"])
+
+    # 1) SSR sweep + per-point hourly flows (the "why" behind each design).
+    table, point_flows = land_allocation_sweep(df, params, total_area_ha=total_area_ha,
+                                               ssr_targets_pct=tuple(ssr_targets),
+                                               return_flows=True, **land_kw)
+
+    # 2) Recommended design — the lowest grid connection this site+battery can reach
+    #    (least battery that gets there) — with its own hourly flows.
+    best = solve_land_split(df, params, total_area_ha=total_area_ha, ssr_target_pct=0.0,
+                            objective="min_grid", return_flows=True, **land_kw)
+    best_flows = best.pop("flows", None)
+    if best_flows is not None:
+        point_flows = {"Recommended": best_flows, **point_flows}
+
+    # 3) Grid ↔ battery trade-off — how much battery buys how much grid reduction,
+    #    from 0 up to the battery the recommended design uses.
+    max_batt = best.get("bess_mwh", 0.0) if best.get("feasible") else eff["site_max_bess_mwh"]
+    steps = sorted({round(max_batt * f, 1) for f in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)}) \
+        if (max_batt and max_batt > 1e-6) else [0.0]
+    tradeoff = grid_battery_tradeoff(df, params, total_area_ha=total_area_ha,
+                                     battery_mwh_steps=steps, **land_kw)
 
     meta = {
         "total_area_ha": total_area_ha, "dc_ha": dc_ha, "dc_m2_per_mw": dc_m2_per_mw,
@@ -708,16 +727,21 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total
         "solar_density_mw_per_ha": solar_rho, "wind_density_mw_per_ha": wind_rho,
         "load_peak_mw": load_peak, "dt_hours": prof.dt_hours,
     }
-    _write_land_split(out_path, inputs, table, meta, parcels, loads, profile_used=profile_used)
+    _write_land_split(out_path, inputs, table, best, tradeoff, point_flows, meta, parcels, loads,
+                      profile_used=profile_used)
     return Path(out_path)
 
 
-def _write_land_split(out_path, inputs, table, meta, parcels, loads, *, profile_used="") -> None:
-    """Write the land-allocation SSR sweep: Inputs · Run Info · SSR Sweep (+charts) · Parcels · Loads."""
+def _write_land_split(out_path, inputs, table, best, tradeoff, point_flows, meta, parcels, loads,
+                      *, profile_used="") -> None:
+    """Write the integrated land workbook: Inputs · Run Info · Recommended Design ·
+    SSR Sweep (+charts) · Grid vs Battery (+charts) · per-point Flows · Parcels · Loads."""
     out_path = Path(out_path)
     eff = _effective(inputs)
     has_rows = table is not None and not table.empty
     n_feasible = int(table["feasible"].sum()) if (has_rows and "feasible" in table) else 0
+    _chart_sheets = ("SSR Sweep", "Grid vs Battery")
+    _flow_sheets = set()
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         _input_template_frame(values=eff).to_excel(xw, sheet_name="Inputs", index=False)
@@ -738,9 +762,36 @@ def _write_land_split(out_path, inputs, table, meta, parcels, loads, *, profile_
         }
         _kv({k: _text(v) for k, v in info.items()}).to_excel(xw, sheet_name="Run Info", index=False)
 
+        # Headline: the recommended (lowest achievable grid connection) design.
+        if best is not None and best.get("feasible"):
+            rec = {
+                "Lowest grid connection (MW)": best["gcmin_mw"],
+                "Achieved SSR (%)": best["achieved_ssr_pct"],
+                "Data-centre land (ha)": best["dc_ha"],
+                "Solar (ha)": best["solar_ha"], "Solar (MW)": best["solar_mw"],
+                "Wind (ha)": best["wind_ha"], "Wind (MW)": best["wind_mw"],
+                "Battery (ha)": best["battery_ha"], "Battery (MW)": best["bess_mw"], "Battery (MWh)": best["bess_mwh"],
+                "Land used (ha)": best["land_used_ha"], "Land spare (ha)": best["land_spare_ha"],
+                "Curtailment (%)": best["curtailment_pct"],
+            }
+            _kv({k: _round(v) for k, v in rec.items()}).to_excel(xw, sheet_name="Recommended Design", index=False)
+
         if has_rows:
             table.to_excel(xw, sheet_name="SSR Sweep", index=False)
             _add_land_split_charts(xw.sheets["SSR Sweep"], len(table))
+
+        if tradeoff is not None and not tradeoff.empty:
+            tradeoff.to_excel(xw, sheet_name="Grid vs Battery", index=False)
+            _add_tradeoff_charts(xw.sheets["Grid vs Battery"], len(tradeoff))
+
+        # Per-point hourly dispatch — the timeseries "why" behind each design.
+        for label, fdf in (point_flows or {}).items():
+            if fdf is None or fdf.empty:
+                continue
+            sheet = f"Flows {label}"[:31]
+            fdf.to_excel(xw, sheet_name=sheet, index=False)
+            _flow_sheets.add(sheet)
+
         if parcels:
             pd.DataFrame([
                 {"tech": t, "area_ha": p["area_ha"], "lat": p["lat"], "lon": p["lon"],
@@ -750,7 +801,52 @@ def _write_land_split(out_path, inputs, table, meta, parcels, loads, *, profile_
         if loads:
             pd.DataFrame(loads).to_excel(xw, sheet_name="Loads", index=False)
         for ws in xw.book.worksheets:
-            _autofit(ws, freeze=("B2" if ws.title == "SSR Sweep" else "A2"))
+            if ws.title in _flow_sheets:
+                ws.freeze_panes = "B2"          # header + timestamp; skip slow autofit on 8760 rows
+            else:
+                _autofit(ws, freeze=("B2" if ws.title in _chart_sheets else "A2"))
+
+
+def _add_tradeoff_charts(ws, n_rows: int) -> None:
+    """Grid↔battery trade-off charts: grid connection vs battery (scatter/line) and the
+    four-way land split by battery (stacked). Columns match grid_battery_tradeoff()."""
+    if n_rows < 1:
+        return
+    from openpyxl.chart import BarChart, ScatterChart, Reference, Series
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.chart.marker import Marker
+    from openpyxl.drawing.line import LineProperties
+
+    DC, SOLAR, WIND, BATT, GRID = "8894A0", "EDA100", "2A78D6", "1F8F1F", "4A3AA7"
+    r1 = n_rows + 1
+    # cols: 1 battery_cap · 3 gcmin · 6 dc_ha · 7 solar_ha · 8 wind_ha · 9 battery_ha
+
+    def paint(series, hexc, line=False):
+        gp = GraphicalProperties()
+        if line:
+            gp.line = LineProperties(solidFill=hexc, w=28000)
+        else:
+            gp.solidFill = hexc
+        series.graphicalProperties = gp
+
+    sc = ScatterChart(); sc.title = "Grid connection vs battery"
+    sc.x_axis.title = "Battery (MWh)"; sc.y_axis.title = "Grid connection (MW)"
+    sc.height, sc.width, sc.legend = 8, 15, None
+    s = Series(Reference(ws, min_col=3, min_row=1, max_row=r1),
+               Reference(ws, min_col=1, min_row=2, max_row=r1), title_from_data=True)
+    paint(s, GRID, line=True); s.marker = Marker(symbol="circle", size=6)
+    sc.series.append(s); ws.add_chart(sc, "M2")
+
+    bar = BarChart(); bar.type = "col"; bar.grouping = "stacked"; bar.overlap = 100
+    bar.title = "Land split by battery"; bar.y_axis.title = "hectares"; bar.x_axis.title = "Battery cap (MWh)"
+    bar.height, bar.width = 8, 15
+    cats = Reference(ws, min_col=1, min_row=2, max_row=r1)
+    for col in (6, 7, 8, 9):                        # dc_ha, solar_ha, wind_ha, battery_ha
+        bar.add_data(Reference(ws, min_col=col, min_row=1, max_row=r1), titles_from_data=True)
+    bar.set_categories(cats)
+    for i, c in enumerate((DC, SOLAR, WIND, BATT)):
+        paint(bar.series[i], c)
+    ws.add_chart(bar, "M20")
 
 
 def _add_land_split_charts(ws, n_rows: int) -> None:
