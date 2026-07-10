@@ -123,13 +123,15 @@ FIELDS: list[dict] = [
     dict(key="sizing_basis", type="str", default="lp", group="Objective",
          help="Sizing basis: lp (LP lower-bound), deliverable (causal-rule bisection), eol (deliverable + EoL gross-up)."),
 
-    # ── Land split (solar ↔ wind co-optimisation over ONE shared parcel) ──
-    dict(key="land_split", type="bool", default=False, group="Land split",
-         help="true ⇒ co-decide the solar/wind split of a shared land budget, per SSR. Overrides the normal scenario."),
-    dict(key="total_area_ha", type="float", default="", group="Land split",
-         help="Shared buildable land (ha) split between solar & wind. Blank ⇒ largest Parcels area."),
-    dict(key="land_split_objective", type="str", default="min_grid", group="Land split",
-         help="min_grid (least grid connection: lowest-grid design + grid↔battery trade-off) | min_bess (per-SSR frontier)."),
+    # ── Land (whole-site allocation across the SSR sweep) ──
+    #    Set total_area_ha to run the land-allocation SSR sweep: each SSR point carves
+    #    the site into DC / solar / wind / battery land and reports the grid connection.
+    dict(key="total_area_ha", type="float", default="", group="Land",
+         help="Total buildable site (ha), split across DC + solar + wind + battery. Set this to run the land-allocation SSR sweep. Blank ⇒ largest Parcels area."),
+    dict(key="dc_land_m2_per_mw", type="float", default=1500.0, group="Land",
+         help="Data-centre land per MW of load (m²/MW), incl. cooling, generators, substation, clearances (~1500–2000). DC land = load_MW × this ÷ 10,000 ha."),
+    dict(key="battery_land_m2_per_mwh", type="float", default=50.0, group="Land",
+         help="Battery land per MWh (m²/MWh), incl. PCS, cooling, NFPA-855 fire clearances (~40–60). Battery land = BESS_MWh × this ÷ 10,000 ha."),
 
     # ── Topology & site limits ──
     dict(key="site_topology", type="str", default="", group="Topology & site limits",
@@ -589,11 +591,14 @@ def run_workbook(
         raise FileNotFoundError(f"Profile file not found: {profile_path}")
     prof = read_profiles(profile_path)
 
-    # ── Land-split co-optimisation: solar & wind share ONE land budget (a separate
-    #    LP, core/land_split.py). Short-circuits the single-nameplate scenario flow.
-    if bool(inputs.get("land_split")):
+    # ── Land-allocation SSR sweep: when a total site area is given (or Parcels
+    #    describe the land), each SSR point carves the site into DC / solar / wind /
+    #    battery and reports the grid connection (core/land_split.py).
+    _total_area = inputs.get("total_area_ha") or max(
+        [p["area_ha"] for p in parcels.values() if p.get("area_ha")] or [0.0])
+    if _total_area and _total_area > 0:
         return _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof,
-                               profile_used=str(profile_path))
+                               total_area_ha=float(_total_area), profile_used=str(profile_path))
 
     # ── Land-first derivation: parcels set the nameplates when not given explicitly.
     if parcels.get("solar") and inputs.get("pv_mw") is None:
@@ -655,38 +660,31 @@ def _parcel_density(parcel: Optional[dict], default: float) -> float:
     return default
 
 
-def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, profile_used="") -> Path:
-    """Co-optimise the solar/wind split of a shared land budget. Objective:
-      min_grid (default) → the lowest-grid design (headline) + the grid↔battery
-                           trade-off (how much battery buys how much grid reduction).
-      min_bess           → the per-SSR land-split frontier.
-    Uses the RAW (unfolded) solar/wind profiles so each is an independent LP variable."""
-    from core.land_split import (land_split_frontier, grid_battery_tradeoff,
-                                  solve_land_split, SOLAR_MW_PER_HA, WIND_MW_PER_HA)
+def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, total_area_ha, profile_used="") -> Path:
+    """Land-allocation SSR sweep: for each SSR target, carve the whole site across
+    DC / solar / wind / battery and report the grid connection — one integrated
+    Frontier ('SSR Sweep' sheet). Uses the RAW (unfolded) solar/wind profiles so
+    each is an independent LP variable."""
+    from core.land_split import (land_allocation_sweep, SOLAR_MW_PER_HA, WIND_MW_PER_HA,
+                                 BATTERY_MWH_PER_HA, DC_M2_PER_MW)
     eff = _effective(inputs)
 
-    # Scale the load shape to the combined consumer peak (Loads sheet or load_peak_mw).
+    # Scale the load shape to the DC's peak (Loads sheet or load_peak_mw).
     df = prof.df.copy()
     peak = eff["load_peak_mw"] or loads_peak or None
     if peak and float(df["load_mw"].max()) > 1e-9:
         df["load_mw"] = df["load_mw"] * (float(peak) / float(df["load_mw"].max()))
+    load_peak = float(df["load_mw"].max())
 
-    # Shared land budget: explicit, else the largest Parcels area (the solar/wind
-    # rows describe the SAME shared land, so take the max — not the sum).
-    total_area_ha = eff["total_area_ha"]
-    if not total_area_ha:
-        areas = [p["area_ha"] for p in parcels.values() if p.get("area_ha")]
-        total_area_ha = max(areas) if areas else None
-    if not total_area_ha:
-        raise ValueError("land_split needs a shared land budget — set total_area_ha or add a Parcels sheet.")
-    total_area_ha = float(total_area_ha)
-
-    objective = (eff["land_split_objective"] or "min_grid").strip().lower()
-    if objective not in ("min_grid", "min_bess"):
-        objective = "min_grid"
+    # Data-centre land carved out first, dynamic with the load (m²/MW → ha).
+    dc_m2_per_mw = eff["dc_land_m2_per_mw"] or DC_M2_PER_MW
+    dc_ha = round(load_peak * dc_m2_per_mw / 10000.0, 2)
+    # Battery land per MWh (m²/MWh) → the engine's MWh/ha density.
+    batt_m2_per_mwh = eff["battery_land_m2_per_mwh"] or (10000.0 / BATTERY_MWH_PER_HA)
+    batt_density = 10000.0 / batt_m2_per_mwh if batt_m2_per_mwh > 0 else BATTERY_MWH_PER_HA
     solar_rho = _parcel_density(parcels.get("solar"), SOLAR_MW_PER_HA)
     wind_rho = _parcel_density(parcels.get("wind"), WIND_MW_PER_HA)
-    tl = eff["solver_time_limit"]
+    ssr_targets = eff["ssr_targets_pct"] or [50.0, 60.0, 70.0, 80.0, 90.0]
 
     params = PhysicalParams(
         dt_hours=prof.dt_hours,
@@ -698,85 +696,51 @@ def _run_land_split(out_path, inputs, parcels, loads, loads_peak, prof, *, profi
         site_max_grid_mw=eff["site_max_grid_mw"],
         site_topology="grid_connected_btm",
     )
-    kw = dict(solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho, time_limit=tl)
-
-    single, table, table_sheet = None, None, "Land Split"
-    if objective == "min_grid":
-        # Headline: the lowest achievable grid connection (battery up to site cap),
-        # with the least battery that reaches it.
-        single = solve_land_split(df, params, total_area_ha=total_area_ha,
-                                  ssr_target_pct=0.0, objective="min_grid", **kw)
-        # Trade-off: grid connection vs battery, from 0 up to the battery the
-        # lowest-grid design uses (beyond it the grid can't improve).
-        max_batt = single.get("bess_mwh", 0.0) if single.get("feasible") else eff["site_max_bess_mwh"]
-        steps = sorted({round(max_batt * f, 1) for f in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)}) \
-            if (max_batt and max_batt > 1e-6) else [0.0]
-        table = grid_battery_tradeoff(df, params, total_area_ha=total_area_ha,
-                                      battery_mwh_steps=steps, **kw)
-        table_sheet = "Grid vs Battery"
-    else:
-        ssr_targets = eff["ssr_targets_pct"] or [50.0, 60.0, 70.0, 80.0, 90.0]
-        table = land_split_frontier(df, params, total_area_ha=total_area_ha,
-                                    ssr_targets_pct=tuple(ssr_targets), objective="min_bess", **kw)
-        table_sheet = "Land Split"
+    table = land_allocation_sweep(
+        df, params, total_area_ha=total_area_ha, dc_ha=dc_ha,
+        ssr_targets_pct=tuple(ssr_targets), battery_mwh_per_ha=batt_density,
+        solar_density_mw_per_ha=solar_rho, wind_density_mw_per_ha=wind_rho,
+        time_limit=eff["solver_time_limit"])
 
     meta = {
-        "total_area_ha": total_area_ha, "objective": objective,
+        "total_area_ha": total_area_ha, "dc_ha": dc_ha, "dc_m2_per_mw": dc_m2_per_mw,
+        "battery_m2_per_mwh": round(batt_m2_per_mwh, 1), "avail_ha": round(total_area_ha - dc_ha, 1),
         "solar_density_mw_per_ha": solar_rho, "wind_density_mw_per_ha": wind_rho,
-        "load_peak_mw": float(df["load_mw"].max()), "dt_hours": prof.dt_hours,
+        "load_peak_mw": load_peak, "dt_hours": prof.dt_hours,
     }
-    _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcels, loads,
-                      profile_used=profile_used)
+    _write_land_split(out_path, inputs, table, meta, parcels, loads, profile_used=profile_used)
     return Path(out_path)
 
 
-def _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcels, loads,
-                      *, profile_used="") -> None:
-    """Write a land-split workbook: Inputs · Run Info · [Min Grid Design] · <table> · Parcels · Loads."""
+def _write_land_split(out_path, inputs, table, meta, parcels, loads, *, profile_used="") -> None:
+    """Write the land-allocation SSR sweep: Inputs · Run Info · SSR Sweep (+charts) · Parcels · Loads."""
     out_path = Path(out_path)
     eff = _effective(inputs)
     has_rows = table is not None and not table.empty
-    obj = meta.get("objective")
-    obj_txt = ("least grid connection (lowest-grid design + grid↔battery trade-off)"
-               if obj == "min_grid" else "least BESS per SSR (grid connection reported)")
+    n_feasible = int(table["feasible"].sum()) if (has_rows and "feasible" in table) else 0
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         _input_template_frame(values=eff).to_excel(xw, sheet_name="Inputs", index=False)
         info = {
             "Project": eff.get("project_name") or "DIP Project",
             "Location": eff.get("location") or "",
-            "Analysis": "Solar/Wind Land Split (co-optimised)",
-            "Objective": obj_txt,
-            "Shared land (ha)": meta.get("total_area_ha"),
+            "Analysis": "Land-allocation SSR sweep (DC + solar + wind + battery)",
+            "Total site (ha)": meta.get("total_area_ha"),
+            "Data-centre land (ha)": f"{meta.get('dc_ha')}  (= {round(meta.get('load_peak_mw', 0), 1)} MW × {meta.get('dc_m2_per_mw')} m²/MW)",
+            "Land for gen + storage (ha)": meta.get("avail_ha"),
             "Solar density (MW/ha)": meta.get("solar_density_mw_per_ha"),
             "Wind density (MW/ha)": meta.get("wind_density_mw_per_ha"),
-            "Load peak (MW)": round(meta.get("load_peak_mw", 0.0), 3),
+            "Battery land (m²/MWh)": meta.get("battery_m2_per_mwh"),
+            "DC load peak (MW)": round(meta.get("load_peak_mw", 0.0), 3),
+            "SSR points solved": n_feasible,
+            "Profile used": profile_used,
+            "Generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
-        if single is not None:
-            info["Lowest grid connection (MW)"] = (single.get("gcmin_mw") if single.get("feasible")
-                                                   else "infeasible")
-        info["Profile used"] = profile_used
-        info["Generated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         _kv({k: _text(v) for k, v in info.items()}).to_excel(xw, sheet_name="Run Info", index=False)
 
-        # Headline single design (min_grid): the lowest-grid land split + battery.
-        if single is not None and single.get("feasible"):
-            design = {
-                "Lowest grid connection GCmin (MW)": single["gcmin_mw"],
-                "Solar (ha)": single["solar_ha"], "Solar (MW)": single["solar_mw"],
-                "Wind (ha)": single["wind_ha"], "Wind (MW)": single["wind_mw"],
-                "Solar share of land (%)": single["solar_share_pct"],
-                "Total land used (ha)": single["total_land_ha"],
-                "BESS (MW)": single["bess_mw"], "BESS (MWh)": single["bess_mwh"],
-                "Achieved SSR (%)": single["achieved_ssr_pct"],
-                "Curtailment (%)": single["curtailment_pct"],
-            }
-            _kv({k: _round(v) for k, v in design.items()}).to_excel(
-                xw, sheet_name="Min Grid Design", index=False)
-
         if has_rows:
-            table.to_excel(xw, sheet_name=table_sheet, index=False)
-            _add_land_split_charts(xw.sheets[table_sheet], len(table), obj)
+            table.to_excel(xw, sheet_name="SSR Sweep", index=False)
+            _add_land_split_charts(xw.sheets["SSR Sweep"], len(table))
         if parcels:
             pd.DataFrame([
                 {"tech": t, "area_ha": p["area_ha"], "lat": p["lat"], "lon": p["lon"],
@@ -786,72 +750,59 @@ def _write_land_split(out_path, inputs, single, table, table_sheet, meta, parcel
         if loads:
             pd.DataFrame(loads).to_excel(xw, sheet_name="Loads", index=False)
         for ws in xw.book.worksheets:
-            _autofit(ws, freeze=("B2" if ws.title in ("Land Split", "Grid vs Battery") else "A2"))
+            _autofit(ws, freeze=("B2" if ws.title == "SSR Sweep" else "A2"))
 
 
-def _add_land_split_charts(ws, n_rows: int, objective: str) -> None:
-    """Embed native Excel charts on the land-split result sheet so the trade-off is
-    visual, not just tabular. Column positions follow the column order written just
-    above (min_grid → Grid vs Battery cols; min_bess → Land Split cols). Series are
-    coloured to match the decision view (solar amber, wind blue, battery green,
-    grid violet)."""
+def _add_land_split_charts(ws, n_rows: int) -> None:
+    """Embed native Excel charts on the SSR Sweep sheet: the four-way land allocation
+    (DC + solar + wind + battery, stacked), the grid connection, and battery size —
+    all across the SSR sweep. Column order matches land_allocation_sweep()."""
     if n_rows < 1:
         return
-    from openpyxl.chart import BarChart, LineChart, ScatterChart, Reference, Series
+    from openpyxl.chart import BarChart, LineChart, Reference
     from openpyxl.chart.shapes import GraphicalProperties
-    from openpyxl.chart.marker import Marker
     from openpyxl.drawing.line import LineProperties
 
-    SOLAR, WIND, BATT, GRID = "EDA100", "2A78D6", "1F8F1F", "4A3AA7"
-    r1 = n_rows + 1                              # header row 1, data rows 2..n+1
+    DC, SOLAR, WIND, BATT, GRID = "8894A0", "EDA100", "2A78D6", "1F8F1F", "4A3AA7"
+    r1 = n_rows + 1
+    # SSR Sweep cols (1-based): 1 ssr · 4 gcmin · 5 dc_ha · 6 solar_ha · 8 wind_ha ·
+    #                           10 battery_ha · 12 bess_mwh
+    cats = Reference(ws, min_col=1, min_row=2, max_row=r1)
 
     def paint(series, hexc, line=False):
+        gp = GraphicalProperties()
         if line:
-            gp = GraphicalProperties(); gp.line = LineProperties(solidFill=hexc, w=28000)
+            gp.line = LineProperties(solidFill=hexc, w=28000)
         else:
-            gp = GraphicalProperties(solidFill=hexc)
+            gp.solidFill = hexc
         series.graphicalProperties = gp
 
-    if objective == "min_grid":
-        # Grid vs Battery: A battery_cap · C gcmin · F solar_ha · G wind_ha
-        sc = ScatterChart(); sc.title = "Grid connection vs battery"
-        sc.x_axis.title = "Battery (MWh)"; sc.y_axis.title = "Grid connection (MW)"
-        sc.height, sc.width, sc.legend = 8, 15, None
-        s = Series(Reference(ws, min_col=3, min_row=1, max_row=r1),
-                   Reference(ws, min_col=1, min_row=2, max_row=r1), title_from_data=True)
-        paint(s, GRID, line=True); s.marker = Marker(symbol="circle", size=6)
-        sc.series.append(s); ws.add_chart(sc, "L2")
+    # 1) four-way land allocation (stacked ha) — DC / solar / wind / battery
+    land = BarChart(); land.type = "col"; land.grouping = "stacked"; land.overlap = 100
+    land.title = "Land allocation by self-sufficiency"; land.y_axis.title = "hectares"; land.x_axis.title = "SSR %"
+    land.height, land.width = 8, 16
+    for col in (5, 6, 8, 10):                       # dc_ha, solar_ha, wind_ha, battery_ha
+        land.add_data(Reference(ws, min_col=col, min_row=1, max_row=r1), titles_from_data=True)
+    land.set_categories(cats)
+    for i, c in enumerate((DC, SOLAR, WIND, BATT)):
+        paint(land.series[i], c)
+    ws.add_chart(land, "R2")
 
-        bc = BarChart(); bc.type = "col"; bc.grouping = "stacked"; bc.overlap = 100
-        bc.title = "Land split by battery"; bc.y_axis.title = "hectares"; bc.x_axis.title = "Battery cap (MWh)"
-        bc.height, bc.width = 8, 15
-        bc.add_data(Reference(ws, min_col=6, max_col=7, min_row=1, max_row=r1), titles_from_data=True)
-        bc.set_categories(Reference(ws, min_col=1, min_row=2, max_row=r1))
-        paint(bc.series[0], SOLAR); paint(bc.series[1], WIND)
-        ws.add_chart(bc, "L20")
-    else:
-        # Land Split per SSR: A ssr · D gcmin · G solar_ha · H wind_ha · L bess_mwh
-        cats = Reference(ws, min_col=1, min_row=2, max_row=r1)
-        land = BarChart(); land.type = "col"; land.grouping = "stacked"; land.overlap = 100
-        land.title = "Land allocation by self-sufficiency"; land.y_axis.title = "hectares"; land.x_axis.title = "SSR %"
-        land.height, land.width = 7.5, 15
-        land.add_data(Reference(ws, min_col=7, max_col=8, min_row=1, max_row=r1), titles_from_data=True)
-        land.set_categories(cats); paint(land.series[0], SOLAR); paint(land.series[1], WIND)
-        ws.add_chart(land, "P2")
+    # 2) grid connection (line)
+    grid = LineChart(); grid.legend = None
+    grid.title = "Grid connection by self-sufficiency"; grid.y_axis.title = "MW"; grid.x_axis.title = "SSR %"
+    grid.height, grid.width = 7.5, 16
+    grid.add_data(Reference(ws, min_col=4, min_row=1, max_row=r1), titles_from_data=True)
+    grid.set_categories(cats); paint(grid.series[0], GRID, line=True)
+    ws.add_chart(grid, "R19")
 
-        batt = BarChart(); batt.type = "col"; batt.legend = None
-        batt.title = "Battery by self-sufficiency"; batt.y_axis.title = "MWh"; batt.x_axis.title = "SSR %"
-        batt.height, batt.width = 7.5, 15
-        batt.add_data(Reference(ws, min_col=12, max_col=12, min_row=1, max_row=r1), titles_from_data=True)
-        batt.set_categories(cats); paint(batt.series[0], BATT)
-        ws.add_chart(batt, "P18")
-
-        grid = LineChart(); grid.legend = None
-        grid.title = "Grid connection by self-sufficiency"; grid.y_axis.title = "MW"; grid.x_axis.title = "SSR %"
-        grid.height, grid.width = 7.5, 15
-        grid.add_data(Reference(ws, min_col=4, max_col=4, min_row=1, max_row=r1), titles_from_data=True)
-        grid.set_categories(cats); paint(grid.series[0], GRID, line=True)
-        ws.add_chart(grid, "P34")
+    # 3) battery capacity (MWh bar)
+    batt = BarChart(); batt.type = "col"; batt.legend = None
+    batt.title = "Battery by self-sufficiency"; batt.y_axis.title = "MWh"; batt.x_axis.title = "SSR %"
+    batt.height, batt.width = 7.5, 16
+    batt.add_data(Reference(ws, min_col=12, min_row=1, max_row=r1), titles_from_data=True)
+    batt.set_categories(cats); paint(batt.series[0], BATT)
+    ws.add_chart(batt, "R35")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
